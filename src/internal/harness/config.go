@@ -107,9 +107,12 @@ func (c ModelConfig) BuildModel() (model.Model, error) {
 	case "deepseek":
 		return model.NewDeepSeek(model.OpenAIConfig{
 			APIKey:  c.APIKey,
+			BaseURL: c.BaseURL,
 			ModelID: c.ModelID,
 			Timeout: timeout,
 		}), nil
+	case "mock":
+		return model.NewMock(c.ModelID), nil
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", c.Provider)
 	}

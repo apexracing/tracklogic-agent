@@ -38,11 +38,15 @@ func NewClient(baseURL string, timeout time.Duration) *Client {
 
 func (c *Client) Initialize(ctx context.Context) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	if c.initialized {
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
 
 	params := InitializeParams{
 		ProtocolVersion: "2025-03-26",
-		Capabilities: ClientCapabilities{},
+		Capabilities:    ClientCapabilities{},
 		ClientInfo: Implementation{
 			Name:    "go-harness",
 			Version: "1.0.0",
@@ -59,8 +63,11 @@ func (c *Client) Initialize(ctx context.Context) error {
 		return fmt.Errorf("parse initialize result: %w", err)
 	}
 
+	c.mu.Lock()
 	c.capabilities = result.Capabilities
 	c.initialized = true
+	c.mu.Unlock()
+
 	c.logger.Info("MCP server initialized", "server", result.ServerInfo.Name)
 	return nil
 }
@@ -136,11 +143,14 @@ func (c *Client) ToToolDefinitions(ctx context.Context) ([]model.ToolDefinition,
 }
 
 func (c *Client) call(ctx context.Context, method string, params any) (*Response, error) {
+	c.mu.Lock()
 	c.reqID++
+	id := c.reqID
+	c.mu.Unlock()
 
 	req := Request{
 		JSONRPC: Version2,
-		ID:      c.reqID,
+		ID:      id,
 		Method:  method,
 		Params:  params,
 	}

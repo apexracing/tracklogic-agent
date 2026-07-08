@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"go-harness-tutorial/internal/engine"
-	"go-harness-tutorial/pkg/types"
 )
 
 type NodeType string
@@ -28,21 +27,41 @@ type Node interface {
 }
 
 type StepNode struct {
-	id    string
-	Agent *engine.Agent
+	id            string
+	Agent         *engine.Agent
+	AfterExecute  func(input, output string, state map[string]any)
+	InputStateKey string
 }
 
-func NewStepNode(id string, agent *engine.Agent) *StepNode {
-	return &StepNode{id: id, Agent: agent}
+func NewStepNode(id string, agent *engine.Agent, after ...func(input, output string, state map[string]any)) *StepNode {
+	n := &StepNode{id: id, Agent: agent}
+	if len(after) > 0 {
+		n.AfterExecute = after[0]
+	}
+	return n
 }
 
-func (n *StepNode) ID() string { return n.id }
+func (n *StepNode) WithInputFromState(key string) *StepNode {
+	n.InputStateKey = key
+	return n
+}
+
+func (n *StepNode) ID() string     { return n.id }
 func (n *StepNode) Type() NodeType { return NodeTypeStep }
 
 func (n *StepNode) Execute(ctx context.Context, input string, state map[string]any) (string, error) {
-	output := n.Agent.Run(ctx, input)
+	agentInput := input
+	if n.InputStateKey != "" && state != nil {
+		if v, ok := state[n.InputStateKey].(string); ok && v != "" {
+			agentInput = v
+		}
+	}
+	output := n.Agent.Run(ctx, agentInput)
 	if !output.Success {
 		return "", fmt.Errorf("step %s failed: %s", n.id, output.Error)
+	}
+	if n.AfterExecute != nil && state != nil {
+		n.AfterExecute(agentInput, output.Content, state)
 	}
 	return output.Content, nil
 }
@@ -207,6 +226,7 @@ func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 	start := time.Now()
 	w.logger.Info("workflow started", "nodes", len(w.Nodes))
 
+	w.State["user_input"] = input
 	current := input
 	var stepLogs []StepLog
 

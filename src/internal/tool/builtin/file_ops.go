@@ -65,7 +65,7 @@ func (t *ReadFileTool) safePath(path string) (string, error) {
 		return "", err
 	}
 	rel, err := filepath.Rel(absAllowed, absPath)
-	if err != nil || rel[:2] == ".." {
+	if err != nil || len(rel) >= 2 && rel[:2] == ".." || rel == ".." {
 		return "", fmt.Errorf("path traversal detected: %q is outside allowed directory", path)
 	}
 	return absPath, nil
@@ -128,7 +128,7 @@ func (t *WriteFileTool) safePath(path string) (string, error) {
 		return "", err
 	}
 	rel, err := filepath.Rel(absAllowed, absPath)
-	if err != nil || len(rel) >= 2 && rel[:2] == ".." {
+	if err != nil || len(rel) >= 2 && rel[:2] == ".." || rel == ".." {
 		return "", fmt.Errorf("path traversal detected")
 	}
 	return absPath, nil

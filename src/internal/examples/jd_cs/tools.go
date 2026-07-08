@@ -219,8 +219,8 @@ func (t *CreateRefundTool) Execute(ctx context.Context, args map[string]any) (an
 	reqID := fmt.Sprintf("ref%s", orderID)
 	return map[string]any{
 		"request_id": reqID, "order_id": orderID,
-		"amount": amount, "status": "pending",
-		"message": fmt.Sprintf("退款申请已提交，金额 ¥%.2f，等待审核", amount),
+		"amount": amount, "status": "pending", "reason": reason,
+		"message": fmt.Sprintf("退款申请已提交，金额 ¥%.2f，原因：%s，等待审核", amount, reason),
 	}, nil
 }
 
@@ -279,6 +279,6 @@ func (t *SendCouponTool) Execute(ctx context.Context, args map[string]any) (any,
 	return map[string]any{
 		"success": true,
 		"message": fmt.Sprintf("已向用户 %s 发放 ¥%.0f 优惠券。原因：%s", userID, amount, reason),
-		"coupon_id": fmt.Sprintf("cpn_%s_%d", userID, amount),
+		"coupon_id": fmt.Sprintf("cpn_%s_%.0f", userID, amount),
 	}, nil
 }

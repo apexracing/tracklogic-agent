@@ -73,17 +73,23 @@ func (t *Team) Run(ctx context.Context, input string) *TeamOutput {
 }
 
 func (t *Team) applySharedModel(agent *engine.Agent) *engine.Agent {
-	if t.SharedModel == nil {
+	if t.SharedModel == nil || agent == nil {
 		return agent
 	}
+	agent.Model = t.SharedModel
 	return agent
 }
 
 func (t *Team) runSequential(ctx context.Context, input string) *TeamOutput {
+	agents := t.applyAllAgents()
+	if len(agents) == 0 {
+		return &TeamOutput{Success: false, Error: "no agents configured"}
+	}
+
 	outputs := make(map[string]*engine.RunOutput)
 	currentInput := input
 
-	for _, agent := range t.applyAllAgents() {
+	for _, agent := range agents {
 		t.logger.Info("sequential: running agent", "agent", agent.Name)
 		output := agent.Run(ctx, currentInput)
 		outputs[agent.Name] = output
@@ -99,7 +105,7 @@ func (t *Team) runSequential(ctx context.Context, input string) *TeamOutput {
 		currentInput = output.Content
 	}
 
-	finalOutput := outputs[t.Agents[len(t.Agents)-1].Name].Content
+	finalOutput := outputs[agents[len(agents)-1].Name].Content
 	return &TeamOutput{
 		AgentOutputs: outputs,
 		FinalOutput:  finalOutput,

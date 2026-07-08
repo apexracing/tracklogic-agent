@@ -18,13 +18,22 @@ var promptInjectionPatterns = []*regexp.Regexp{
 }
 
 type InputValidator struct {
-	maxLength    int
-	blockedWords []string
+	maxLength            int
+	blockedWords         []string
+	enableInjectionCheck bool
 }
 
 func NewInputValidator() *InputValidator {
+	return NewInputValidatorWithConfig(10000, true)
+}
+
+func NewInputValidatorWithConfig(maxLength int, enableInjectionCheck bool) *InputValidator {
+	if maxLength <= 0 {
+		maxLength = 10000
+	}
 	return &InputValidator{
-		maxLength: 10000,
+		maxLength:            maxLength,
+		enableInjectionCheck: enableInjectionCheck,
 		blockedWords: []string{
 			"<script>", "javascript:", "onerror=", "onload=",
 		},
@@ -38,9 +47,11 @@ func (v *InputValidator) Validate(input string) error {
 	if len(input) > v.maxLength {
 		return fmt.Errorf("input exceeds max length of %d characters", v.maxLength)
 	}
-	for _, pattern := range promptInjectionPatterns {
-		if pattern.MatchString(input) {
-			return fmt.Errorf("potential prompt injection detected: matched pattern %q", pattern.String())
+	if v.enableInjectionCheck {
+		for _, pattern := range promptInjectionPatterns {
+			if pattern.MatchString(input) {
+				return fmt.Errorf("potential prompt injection detected: matched pattern %q", pattern.String())
+			}
 		}
 	}
 	lower := strings.ToLower(input)
@@ -57,7 +68,14 @@ type OutputValidator struct {
 }
 
 func NewOutputValidator() *OutputValidator {
-	return &OutputValidator{MaxLength: 50000}
+	return NewOutputValidatorWithMaxLength(50000)
+}
+
+func NewOutputValidatorWithMaxLength(maxLength int) *OutputValidator {
+	if maxLength <= 0 {
+		maxLength = 50000
+	}
+	return &OutputValidator{MaxLength: maxLength}
 }
 
 func (v *OutputValidator) Validate(output string) error {

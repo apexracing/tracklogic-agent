@@ -46,9 +46,9 @@ func classifyIntent(input string) (IntentType, float64) {
 		{IntentGreeting, []string{"你好", "您好", "在吗", "hi", "hello", "嗨", "喂"}, 0.4},
 		{IntentQueryOrder, []string{"订单", "买了", "下单", "购买", "查", "我的订单", "什么时候到"}, 0.5},
 		{IntentTrackLogistics, []string{"物流", "快递", "配送", "发货", "送货", "运单", "顺丰", "到哪"}, 0.6},
-		{IntentRefund, []string{"退款", "退货", "退钱", "不想要", "退款", "退货退款", "取消订单", "七天无理由"}, 0.7},
+		{IntentRefund, []string{"退款", "退货", "退钱", "不想要", "退货退款", "取消订单", "七天无理由"}, 0.7},
 		{IntentRecommend, []string{"推荐", "推荐一下", "有什么", "哪个好", "买什么", "性价比", "推荐一款"}, 0.5},
-		{IntentComplaint, []string{"投诉", "差评", "太差了", "垃圾", "投诉", "不满意", "生气", "态度差"}, 0.6},
+		{IntentComplaint, []string{"投诉", "差评", "太差了", "垃圾", "不满意", "生气", "态度差"}, 0.6},
 		{IntentTransfer, []string{"人工", "转人工", "客服", "找人工", "接人工", "人工客服", "活人"}, 0.8},
 	}
 

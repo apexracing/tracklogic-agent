@@ -129,6 +129,14 @@ func (p *parser) parseTerm() (float64, error) {
 func (p *parser) parseFactor() (float64, error) {
 	p.skipWhitespace()
 	c := p.peek()
+	if c == '-' {
+		p.advance()
+		val, err := p.parseFactor()
+		if err != nil {
+			return 0, err
+		}
+		return -val, nil
+	}
 	if c == '(' {
 		p.advance()
 		result, err := p.parseExpr()

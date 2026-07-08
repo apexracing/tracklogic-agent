@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -19,6 +18,7 @@ func main() {
 	cfg := harness.DefaultConfig()
 	cfg.Name = "JD-CS-Service"
 	cfg.LogLevel = "info"
+	cfg.PermissionMode = "strict"
 
 	cfg.DefaultModel = harness.ModelConfig{
 		Provider: "openai",
@@ -41,7 +41,9 @@ func main() {
 	if apiKey != "" {
 		cfg.DefaultModel.APIKey = apiKey
 	} else {
-		slog.Warn("OPENAI_API_KEY not set — will use mock model fallback")
+		slog.Warn("OPENAI_API_KEY not set — using mock model for demo")
+		cfg.DefaultModel.Provider = "mock"
+		cfg.DefaultModel.ModelID = "mock-jd-cs"
 	}
 
 	h, err := harness.New(cfg)
@@ -61,19 +63,18 @@ func main() {
 	}
 
 	wf := jd_cs.BuildCSWorkflow(triageAgent, orderAgent, refundAgent)
-	_ = wf
-	_ = orderAgent
+	h.Workflows[wf.Name] = wf
 
 	slog.Info("京东智能客服系统就绪")
 
 	fmt.Println("\n═══════════════════════════════════════")
-	fmt.Println("  京东智能客服系统 v1.0 — 模拟会话演示")
+	fmt.Println("  京东智能客服系统 v1.0 — 工作流演示")
 	fmt.Println("═══════════════════════════════════════")
 
-	runTriageDemo(h)
+	runWorkflowDemo(h)
 
 	fmt.Println("\n═══════════════════════════════════════")
-	fmt.Println("  场景批处理测试")
+	fmt.Println("  单 Agent 批处理测试")
 	fmt.Println("═══════════════════════════════════════")
 
 	runBatchTests(h)
@@ -83,7 +84,7 @@ func main() {
 	fmt.Println("═══════════════════════════════════════")
 }
 
-func runTriageDemo(h *harness.Harness) {
+func runWorkflowDemo(h *harness.Harness) {
 	queries := []string{
 		"你好，帮我查一下订单 ord1001 的情况",
 		"我想退货退款，订单是 ord1005，显示器有个坏点",
@@ -93,17 +94,15 @@ func runTriageDemo(h *harness.Harness) {
 
 	for _, q := range queries {
 		fmt.Printf("\n▎ 用户: %s\n", q)
-		output := h.RunAgent(context.Background(), "triage_agent", q, engine.WithMaxLoops(3))
-		if output.Success {
-			safeContent := output.Content
-			if h.Config.Security.SanitizePII {
-				safeContent = h.Sanitize(safeContent)
-			}
-			fmt.Printf("▎ 客服: %s\n", safeContent)
+		result := h.RunWorkflow(context.Background(), "京东智能客服工作流", q)
+		if result.Success {
+			fmt.Printf("▎ 客服: %s\n", truncate(result.Output, 500))
 		} else {
-			fmt.Printf("▎ 客服: （处理中...）%s\n", output.Error)
+			fmt.Printf("▎ 客服: （处理失败）%s\n", result.Error)
 		}
-		fmt.Printf("  ── loop:%d tokens:%d\n", output.LoopCount, output.TotalTokens)
+		if intent, ok := result.State["intent"]; ok {
+			fmt.Printf("  ── intent:%v steps:%d duration:%s\n", intent, len(result.StepLogs), result.Duration)
+		}
 	}
 }
 
@@ -123,11 +122,7 @@ func runBatchTests(h *harness.Harness) {
 
 		output := h.RunAgent(context.Background(), test.agent, test.query, engine.WithMaxLoops(3))
 		if output.Success {
-			content := output.Content
-			if h.Config.Security.SanitizePII {
-				content = h.Sanitize(content)
-			}
-			fmt.Printf("  客服: %s\n", truncate(content, 300))
+			fmt.Printf("  客服: %s\n", truncate(output.Content, 300))
 		} else {
 			fmt.Printf("  ✗ 失败: %s\n", output.Error)
 		}
@@ -135,15 +130,9 @@ func runBatchTests(h *harness.Harness) {
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return string(runes[:n]) + "..."
 }
-
-func toJSON(v any) string {
-	b, _ := json.MarshalIndent(v, "", "  ")
-	return string(b)
-}
-
-var _ = json.MarshalIndent

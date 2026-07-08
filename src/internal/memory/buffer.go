@@ -1,10 +1,13 @@
 package memory
 
 import (
+	"sync"
+
 	"go-harness-tutorial/pkg/types"
 )
 
 type BufferMemory struct {
+	mu       sync.RWMutex
 	messages []types.Message
 	capacity int
 }
@@ -20,14 +23,30 @@ func NewBufferMemory(capacity int) *BufferMemory {
 }
 
 func (m *BufferMemory) Add(msg types.Message) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if len(m.messages) >= m.capacity {
-		keep := m.messages[m.capacity/2:]
-		m.messages = keep
+		cut := m.capacity / 2
+		if cut < 1 {
+			cut = 1
+		}
+		start := 0
+		for start < len(m.messages) && m.messages[start].Role == types.RoleSystem {
+			start++
+		}
+		if start < cut {
+			m.messages = append(m.messages[:start], m.messages[cut:]...)
+		} else {
+			m.messages = m.messages[cut:]
+		}
 	}
 	m.messages = append(m.messages, msg)
 }
 
 func (m *BufferMemory) Get(index int) (types.Message, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if index < 0 || index >= len(m.messages) {
 		return types.Message{}, false
 	}
@@ -35,6 +54,8 @@ func (m *BufferMemory) Get(index int) (types.Message, bool) {
 }
 
 func (m *BufferMemory) Recent(n int) []types.Message {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if n <= 0 {
 		return nil
 	}
@@ -49,15 +70,21 @@ func (m *BufferMemory) Recent(n int) []types.Message {
 }
 
 func (m *BufferMemory) Snapshot() []types.Message {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	result := make([]types.Message, len(m.messages))
 	copy(result, m.messages)
 	return result
 }
 
 func (m *BufferMemory) Clear() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.messages = make([]types.Message, 0, m.capacity)
 }
 
 func (m *BufferMemory) Len() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return len(m.messages)
 }

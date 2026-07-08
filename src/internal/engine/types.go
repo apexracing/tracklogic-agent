@@ -4,16 +4,17 @@ import (
 	"go-harness-tutorial/internal/tool"
 	"go-harness-tutorial/internal/memory"
 	"go-harness-tutorial/internal/model"
+	"go-harness-tutorial/pkg/types"
 )
 
 type RunOutput struct {
-	Content      string            `json:"content"`
-	ToolCalls    []any             `json:"tool_calls,omitempty"`
-	Messages     []any             `json:"messages,omitempty"`
-	Success      bool              `json:"success"`
-	Error        string            `json:"error,omitempty"`
-	TotalTokens  int               `json:"total_tokens"`
-	LoopCount    int               `json:"loop_count"`
+	Content     string           `json:"content"`
+	ToolCalls   []types.ToolCall `json:"tool_calls,omitempty"`
+	Messages    []types.Message  `json:"messages,omitempty"`
+	Success     bool             `json:"success"`
+	Error       string           `json:"error,omitempty"`
+	TotalTokens int              `json:"total_tokens"`
+	LoopCount   int              `json:"loop_count"`
 }
 
 type RunOption func(*runConfig)
@@ -42,10 +43,11 @@ func WithMaxTokens(n int) RunOption {
 }
 
 type AgentConfig struct {
-	Name         string
-	SystemPrompt string
-	Model        model.Model
-	ToolRegistry *tool.Registry
-	Memory       memory.Memory
-	MaxLoops     int
+	Name                string
+	SystemPrompt        string
+	Model               model.Model
+	ToolRegistry        *tool.Registry
+	Memory              memory.Memory
+	MaxLoops            int
+	CheckToolPermission func(toolName string) error
 }

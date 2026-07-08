@@ -2,7 +2,6 @@ package security
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 )
 
@@ -88,5 +87,20 @@ func (pm *PermissionManager) SetRole(role Role) {
 		for _, p := range perms {
 			pm.allowList[p] = true
 		}
+	}
+}
+
+// RequiredPermission returns the permission needed to invoke a tool, if any.
+func RequiredPermission(toolName string) (Permission, bool) {
+	switch toolName {
+	case "read_file":
+		return PermReadFile, true
+	case "write_file":
+		return PermWriteFile, true
+	default:
+		if len(toolName) > 4 && toolName[:4] == "mcp_" {
+			return PermNetAccess, true
+		}
+		return "", false
 	}
 }

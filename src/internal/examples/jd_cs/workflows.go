@@ -1,12 +1,12 @@
 package jd_cs
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"strings"
 
 	"go-harness-tutorial/internal/engine"
+	"go-harness-tutorial/internal/harness"
 	"go-harness-tutorial/internal/orchestrator"
 )
 
@@ -18,60 +18,68 @@ const (
 	stateResult     = "result"
 )
 
+func updateIntentState(input, output string, state map[string]any) {
+	InferStateFromOutput(output, state)
+	intent, _ := classifyIntent(strings.ToLower(input))
+	state[stateIntent] = string(intent)
+}
+
 func BuildCSWorkflow(triageAgent, orderAgent, refundAgent *engine.Agent) *orchestrator.Workflow {
 	wf := orchestrator.NewWorkflow(orchestrator.WorkflowConfig{
 		ID:   "jd-cs-workflow",
 		Name: "京东智能客服工作流",
 	})
 
-	classifyStep := orchestrator.NewStepNode("classify", triageAgent)
+	classifyStep := orchestrator.NewStepNode("classify", triageAgent, updateIntentState)
 
-	handleOrder := orchestrator.NewStepNode("handle_order", orderAgent)
+	handleOrder := orchestrator.NewStepNode("handle_order", orderAgent).WithInputFromState("user_input")
+	handleRefund := orchestrator.NewStepNode("handle_refund", refundAgent).WithInputFromState("user_input")
+	transferNode := orchestrator.NewStepNode("transfer_human", orderAgent).WithInputFromState("user_input")
+	greetingNode := orchestrator.NewStepNode("greeting", orderAgent).WithInputFromState("user_input")
 
-	handleRefund := orchestrator.NewStepNode("handle_refund", refundAgent)
+	nonRefundNode := orchestrator.NewConditionNode("dispatch_transfer",
+		func(input string, state map[string]any) (bool, error) {
+			intent, ok := state[stateIntent].(string)
+			if !ok {
+				return false, nil
+			}
+			return IntentType(intent) == IntentTransfer, nil
+		},
+		transferNode,
+		orchestrator.NewConditionNode("dispatch_greeting",
+			func(input string, state map[string]any) (bool, error) {
+				intent, ok := state[stateIntent].(string)
+				if !ok {
+					return false, nil
+				}
+				return IntentType(intent) == IntentGreeting, nil
+			},
+			greetingNode,
+			handleOrder,
+		),
+	)
 
-	transferNode := orchestrator.NewStepNode("transfer_human", orderAgent)
-
-	routeNode := orchestrator.NewConditionNode("route",
+	dispatchNode := orchestrator.NewConditionNode("dispatch_refund",
 		func(input string, state map[string]any) (bool, error) {
 			intent, ok := state[stateIntent].(string)
 			if !ok {
 				return false, nil
 			}
 			slog.Info("routing based on intent", "intent", intent)
-			switch IntentType(intent) {
-			case IntentRefund:
+			if IntentType(intent) == IntentRefund {
 				state[stateNeedRefund] = true
 				return true, nil
-			case IntentTransfer:
-				return false, nil
-			default:
-				return false, nil
 			}
+			return false, nil
 		},
 		handleRefund,
-		transferNode,
-	)
-
-	greetingNode := orchestrator.NewStepNode("greeting", orderAgent)
-
-	intentGate := orchestrator.NewConditionNode("intent_gate",
-		func(input string, state map[string]any) (bool, error) {
-			intent, ok := state[stateIntent].(string)
-			if !ok {
-				return false, nil
-			}
-			return IntentType(intent) != IntentGreeting, nil
-		},
-		routeNode,
-		greetingNode,
+		nonRefundNode,
 	)
 
 	wf.AddNode(classifyStep)
-	wf.AddNode(intentGate)
-	wf.AddNode(handleOrder)
+	wf.AddNode(dispatchNode)
 
-	wf.SetState(stateIntent, IntentUnknown)
+	wf.SetState(stateIntent, string(IntentUnknown))
 	wf.SetState(stateResult, "")
 
 	return wf
@@ -83,7 +91,7 @@ func BuildSimpleCSWorkflow(triageAgent *engine.Agent) *orchestrator.Workflow {
 		Name: "京东客服简易分流工作流",
 	})
 
-	classifyStep := orchestrator.NewStepNode("classify", triageAgent)
+	classifyStep := orchestrator.NewStepNode("classify", triageAgent, updateIntentState)
 
 	loopNode := orchestrator.NewLoopNode("follow_up",
 		orchestrator.NewStepNode("respond", triageAgent),
@@ -106,9 +114,7 @@ func BuildAfterSalesWorkflow(orderAgent, refundAgent *engine.Agent) *orchestrato
 	})
 
 	verifyOrder := orchestrator.NewStepNode("verify_order", orderAgent)
-
 	processRefund := orchestrator.NewStepNode("process_refund", refundAgent)
-
 	compensationNode := orchestrator.NewStepNode("compensation", orderAgent)
 
 	needsCompensation := orchestrator.NewConditionNode("needs_compensation",
@@ -130,7 +136,7 @@ func BuildAfterSalesWorkflow(orderAgent, refundAgent *engine.Agent) *orchestrato
 	return wf
 }
 
-func BuildTeamCS(h *Harness) error {
+func BuildTeamCS(h *harness.Harness) error {
 	team := h.NewTeam(orchestrator.TeamConfig{
 		ID:   "jd-cs-team",
 		Name: "jd_cs_team",
@@ -143,7 +149,7 @@ func BuildTeamCS(h *Harness) error {
 func InferStateFromOutput(output string, state map[string]any) {
 	outputLower := strings.ToLower(output)
 
-	if state[stateIntent] == nil || state[stateIntent] == IntentUnknown {
+	if state[stateIntent] == nil || state[stateIntent] == string(IntentUnknown) {
 		if strings.Contains(outputLower, "query_order") || strings.Contains(outputLower, "订单") {
 			state[stateIntent] = string(IntentQueryOrder)
 		} else if strings.Contains(outputLower, "refund") || strings.Contains(outputLower, "退款") {

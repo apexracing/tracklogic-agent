@@ -15,15 +15,16 @@ import (
 )
 
 type Agent struct {
-	mu           sync.RWMutex
-	ID           string
-	Name         string
-	SystemPrompt string
-	Model        model.Model
-	ToolRegistry *tool.Registry
-	Memory       memory.Memory
-	MaxLoops     int
-	logger       *slog.Logger
+	mu                  sync.RWMutex
+	ID                  string
+	Name                string
+	SystemPrompt        string
+	Model               model.Model
+	ToolRegistry        *tool.Registry
+	Memory              memory.Memory
+	MaxLoops            int
+	CheckToolPermission func(toolName string) error
+	logger              *slog.Logger
 }
 
 func NewAgent(cfg AgentConfig) *Agent {
@@ -34,13 +35,14 @@ func NewAgent(cfg AgentConfig) *Agent {
 		cfg.Memory = memory.NewBufferMemory(50)
 	}
 	return &Agent{
-		Name:         cfg.Name,
-		SystemPrompt: cfg.SystemPrompt,
-		Model:        cfg.Model,
-		ToolRegistry: cfg.ToolRegistry,
-		Memory:       cfg.Memory,
-		MaxLoops:     cfg.MaxLoops,
-		logger:       slog.With("component", "agent", "name", cfg.Name),
+		Name:                cfg.Name,
+		SystemPrompt:        cfg.SystemPrompt,
+		Model:               cfg.Model,
+		ToolRegistry:        cfg.ToolRegistry,
+		Memory:              cfg.Memory,
+		MaxLoops:            cfg.MaxLoops,
+		CheckToolPermission: cfg.CheckToolPermission,
+		logger:              slog.With("component", "agent", "name", cfg.Name),
 	}
 }
 
@@ -78,7 +80,7 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 		select {
 		case <-ctx.Done():
 			a.logger.Warn("run cancelled", "loop", loopCount)
-			return &RunOutput{Success: false, Error: "context cancelled", LoopCount: loopCount}
+			return &RunOutput{Success: false, Error: types.NewError(types.ErrRunCancelled, "context cancelled").Error(), LoopCount: loopCount}
 		default:
 		}
 
@@ -163,7 +165,7 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 	return &RunOutput{
 		Content:   lastContent,
 		Success:   false,
-		Error:     "max loops exceeded",
+		Error:     types.NewError(types.ErrMaxLoopsExceeded, "max loops exceeded").Error(),
 		LoopCount: loopCount,
 	}
 }
@@ -212,6 +214,12 @@ func (a *Agent) executeToolCall(ctx context.Context, tc types.ToolCall) (string,
 		return "", types.NewError(types.ErrToolError, fmt.Sprintf("tool %q not found", tc.Function.Name))
 	}
 
+	if a.CheckToolPermission != nil {
+		if err := a.CheckToolPermission(tc.Function.Name); err != nil {
+			return "", types.WrapError(types.ErrSecurityViolation, "tool permission denied", err)
+		}
+	}
+
 	var args map[string]any
 	if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
 		return "", types.WrapError(types.ErrInvalidInput, "failed to parse tool arguments", err)
@@ -235,8 +243,9 @@ func (a *Agent) executeToolCall(ctx context.Context, tc types.ToolCall) (string,
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return string(runes[:n]) + "..."
 }

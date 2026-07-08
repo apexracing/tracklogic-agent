@@ -24,7 +24,7 @@ func SetupAgents(h *harness.Harness) (*engine.Agent, *engine.Agent, *engine.Agen
 	}
 
 	triageAgent := h.NewAgent("triage_agent",
-		`你是京东智能客服的三分类系统。
+		`你是京东智能客服的分流系统。
 你的职责是分析用户输入，判断用户意图。
 
 可识别意图：
