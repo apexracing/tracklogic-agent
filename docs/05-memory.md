@@ -31,7 +31,7 @@ graph TD
 
 所有大模型都有上下文窗口限制（Context Window）：
 - GPT-4o-mini: 128K tokens
-- DeepSeek-V3: 128K tokens
+- Claude Sonnet: 200K tokens
 - Claude 3.5 Sonnet: 200K tokens
 
 虽然这些窗口看起来很大，但每次 Agent 循环都会新增消息——用户输入、模型回复、工具调用、工具结果。多轮交互后上下文很容易耗尽。

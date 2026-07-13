@@ -26,7 +26,7 @@ graph LR
 ### 10.1.1 配置优先级
 
 ```
-命令行参数 > 环境变量 > 配置文件 > 默认值
+JSON 配置文件 > DefaultConfig 默认值（Demo 无 -config 与环境变量覆盖）
 ```
 
 ### 10.1.2 配置结构体
@@ -49,11 +49,12 @@ type Config struct {
 
 ```go
 type ModelConfig struct {
-	Provider string  `json:"provider"`   // openai / deepseek
-	ModelID  string  `json:"model_id"`   // gpt-4o-mini
-	APIKey   string  `json:"api_key,omitempty"`   // JSON 中可选
-	BaseURL  string  `json:"base_url,omitempty"`  // 代理地址
-	Timeout  int     `json:"timeout_seconds"`     // 超时秒数
+	Vendor    string `json:"vendor"`     // deepseek / openai / anthropic / custom
+	APIFormat string `json:"api_format"` // openai_response / openai_chat_completions / anthropic_message / mock
+	BaseURL   string `json:"base_url,omitempty"`
+	APIKey    string `json:"api_key,omitempty"`
+	ModelID   string `json:"model_id"`
+	Timeout   int    `json:"timeout_seconds"`
 }
 
 type MemoryConfig struct {
@@ -81,16 +82,20 @@ API Key 等敏感信息不应硬编码在配置文件中，通过环境变量传
 
 ```go
 func (c ModelConfig) BuildModel() (model.Model, error) {
-	apiKey := c.APIKey
-	if apiKey == "" {
-		apiKey = os.Getenv("OPENAI_API_KEY")
+	// 仅根据 api_format 选择客户端；连接参数来自 JSON，不读取 MODEL_* 环境变量。
+	switch c.APIFormat {
+	case "openai_response":
+		return model.NewOpenAI(...)
+	case "openai_chat_completions":
+		return model.NewOpenAIChat(...)
+	case "anthropic_message":
+		return model.NewAnthropic(...)
+	case "mock":
+		return model.NewMock(c.ModelID), nil
+	default:
+		return nil, fmt.Errorf("unsupported api_format: %s", c.APIFormat)
 	}
-	if apiKey == "" {
-		return nil, fmt.Errorf("API key not configured")
-	}
-	// ...
-}
-```
+}```
 
 ### 10.1.5 配置示例
 
@@ -100,7 +105,10 @@ func (c ModelConfig) BuildModel() (model.Model, error) {
   "name": "JD-CS-Production",
   "log_level": "info",
   "default_model": {
-    "provider": "openai",
+    "vendor": "openai",
+    "api_format": "openai_response",
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "",
     "model_id": "gpt-4o-mini",
     "timeout_seconds": 60
   },

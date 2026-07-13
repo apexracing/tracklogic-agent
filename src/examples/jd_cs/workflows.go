@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"go-harness-tutorial/internal/engine"
-	"go-harness-tutorial/internal/harness"
 	"go-harness-tutorial/internal/orchestrator"
 )
 
@@ -85,28 +84,6 @@ func BuildCSWorkflow(triageAgent, orderAgent, refundAgent *engine.Agent) *orches
 	return wf
 }
 
-func BuildSimpleCSWorkflow(triageAgent *engine.Agent) *orchestrator.Workflow {
-	wf := orchestrator.NewWorkflow(orchestrator.WorkflowConfig{
-		ID:   "jd-cs-simple",
-		Name: "京东客服简易分流工作流",
-	})
-
-	classifyStep := orchestrator.NewStepNode("classify", triageAgent, updateIntentState)
-
-	loopNode := orchestrator.NewLoopNode("follow_up",
-		orchestrator.NewStepNode("respond", triageAgent),
-		func(iteration int, input string, state map[string]any) (bool, error) {
-			return iteration < 1, nil
-		},
-		3,
-	)
-
-	wf.AddNode(classifyStep)
-	wf.AddNode(loopNode)
-
-	return wf
-}
-
 func BuildAfterSalesWorkflow(orderAgent, refundAgent *engine.Agent) *orchestrator.Workflow {
 	wf := orchestrator.NewWorkflow(orchestrator.WorkflowConfig{
 		ID:   "after-sales",
@@ -134,16 +111,6 @@ func BuildAfterSalesWorkflow(orderAgent, refundAgent *engine.Agent) *orchestrato
 	wf.AddNode(needsCompensation)
 
 	return wf
-}
-
-func BuildTeamCS(h *harness.Harness) error {
-	team := h.NewTeam(orchestrator.TeamConfig{
-		ID:   "jd-cs-team",
-		Name: "jd_cs_team",
-		Mode: orchestrator.ModeSequential,
-	})
-	_ = team
-	return nil
 }
 
 func InferStateFromOutput(output string, state map[string]any) {

@@ -21,8 +21,8 @@ func NewMock(modelID string) *MockModel {
 	return &MockModel{modelID: modelID}
 }
 
-func (m *MockModel) Provider() string  { return "mock" }
-func (m *MockModel) ModelID() string   { return m.modelID }
+func (m *MockModel) Provider() string { return "mock" }
+func (m *MockModel) ModelID() string  { return m.modelID }
 
 func (m *MockModel) Invoke(ctx context.Context, req *InvokeRequest) (*InvokeResponse, error) {
 	select {
@@ -79,24 +79,39 @@ func lastTurnMessages(msgs []types.Message) []types.Message {
 	return msgs[lastUserIdx:]
 }
 
+func calledToolsInTurn(turn []types.Message) map[string]bool {
+	called := make(map[string]bool)
+	for _, msg := range turn {
+		if msg.Role == types.RoleAssistant {
+			for _, tc := range msg.ToolCalls {
+				called[tc.Function.Name] = true
+			}
+		}
+		if msg.Role == types.RoleTool && msg.Name != "" {
+			called[msg.Name] = true
+		}
+	}
+	return called
+}
+
 func (m *MockModel) pendingToolCall(req *InvokeRequest) *types.ToolCall {
 	if len(req.Tools) == 0 {
 		return nil
 	}
-	turn := lastTurnMessages(req.Messages)
-	for _, msg := range turn {
-		if msg.Role == types.RoleTool {
-			return nil
-		}
-	}
 
-	lastUser := lastUserMessage(req.Messages)
+	turn := lastTurnMessages(req.Messages)
+	called := calledToolsInTurn(turn)
 	toolNames := make(map[string]bool, len(req.Tools))
 	for _, td := range req.Tools {
 		toolNames[td.Name] = true
 	}
 
-	if toolNames["classify_intent"] {
+	lastUser := lastUserMessage(req.Messages)
+	lower := strings.ToLower(lastUser)
+	triageOnly := isTriagePrompt(req.Messages)
+
+	// Step 1: triage — classify intent once when available.
+	if toolNames["classify_intent"] && !called["classify_intent"] {
 		args, _ := json.Marshal(map[string]string{"input": lastUser})
 		return &types.ToolCall{
 			ID:   "mock-classify-1",
@@ -108,9 +123,25 @@ func (m *MockModel) pendingToolCall(req *InvokeRequest) *types.ToolCall {
 		}
 	}
 
-	lower := strings.ToLower(lastUser)
-	if toolNames["create_refund"] && strings.Contains(lower, "退款") {
+	// Triage agent only needs intent classification.
+	if triageOnly {
+		return nil
+	}
+
+	// At most one business tool per user turn.
+	for _, name := range []string{"create_refund", "query_order", "track_logistics", "recommend_product"} {
+		if called[name] {
+			return nil
+		}
+	}
+
+	// Step 2: business tools after classify (or directly if no classify tool).
+	if toolNames["create_refund"] &&
+		(strings.Contains(lower, "退款") || strings.Contains(lower, "退货")) {
 		orderID := extractToken(lastUser, "ord")
+		if orderID == "" {
+			orderID = "ord1005"
+		}
 		args, _ := json.Marshal(map[string]any{
 			"order_id": orderID,
 			"user_id":  "u1002",
@@ -122,17 +153,6 @@ func (m *MockModel) pendingToolCall(req *InvokeRequest) *types.ToolCall {
 			Function: types.ToolCallFunction{Name: "create_refund", Arguments: string(args)},
 		}
 	}
-	if toolNames["track_logistics"] && strings.Contains(lower, "sf") {
-		tracking := extractToken(lastUser, "SF")
-		if tracking == "" {
-			tracking = extractToken(lastUser, "sf")
-		}
-		args, _ := json.Marshal(map[string]string{"tracking_number": tracking})
-		return &types.ToolCall{
-			ID: "mock-track", Type: "function",
-			Function: types.ToolCallFunction{Name: "track_logistics", Arguments: string(args)},
-		}
-	}
 	if toolNames["query_order"] && strings.Contains(lower, "ord") {
 		orderID := extractToken(lastUser, "ord")
 		args, _ := json.Marshal(map[string]string{"order_id": orderID})
@@ -141,7 +161,23 @@ func (m *MockModel) pendingToolCall(req *InvokeRequest) *types.ToolCall {
 			Function: types.ToolCallFunction{Name: "query_order", Arguments: string(args)},
 		}
 	}
-	if toolNames["recommend_product"] && (strings.Contains(lower, "推荐") || strings.Contains(lower, "键盘")) {
+	if toolNames["track_logistics"] &&
+		(strings.Contains(lower, "sf") || strings.Contains(lower, "快递") || strings.Contains(lower, "物流")) {
+		tracking := extractToken(lastUser, "SF")
+		if tracking == "" {
+			tracking = extractToken(lastUser, "sf")
+		}
+		if tracking == "" {
+			tracking = "SF1234567890"
+		}
+		args, _ := json.Marshal(map[string]string{"tracking_number": tracking})
+		return &types.ToolCall{
+			ID: "mock-track", Type: "function",
+			Function: types.ToolCallFunction{Name: "track_logistics", Arguments: string(args)},
+		}
+	}
+	if toolNames["recommend_product"] &&
+		(strings.Contains(lower, "推荐") || strings.Contains(lower, "键盘")) {
 		args, _ := json.Marshal(map[string]string{"keyword": "键盘"})
 		return &types.ToolCall{
 			ID: "mock-recommend", Type: "function",
@@ -151,17 +187,41 @@ func (m *MockModel) pendingToolCall(req *InvokeRequest) *types.ToolCall {
 	return nil
 }
 
-func (m *MockModel) finalReply(req *InvokeRequest, lastUser string) string {
-	turn := lastTurnMessages(req.Messages)
-	var toolResult string
-	for i := len(turn) - 1; i >= 0; i-- {
-		if turn[i].Role == types.RoleTool {
-			toolResult = turn[i].Content
-			break
+func isTriagePrompt(msgs []types.Message) bool {
+	for _, m := range msgs {
+		if m.Role == types.RoleSystem && strings.Contains(m.Content, "分流") {
+			return true
 		}
 	}
-	if toolResult != "" {
-		return fmt.Sprintf("根据系统查询结果：%s\n\n如需进一步帮助，请告诉我。", toolResult)
+	return false
+}
+
+func (m *MockModel) finalReply(req *InvokeRequest, lastUser string) string {
+	turn := lastTurnMessages(req.Messages)
+
+	// Prefer the latest non-classify tool result for a more useful demo reply.
+	var classifyResult, businessResult string
+	for i := len(turn) - 1; i >= 0; i-- {
+		msg := turn[i]
+		if msg.Role != types.RoleTool {
+			continue
+		}
+		if msg.Name == "classify_intent" {
+			if classifyResult == "" {
+				classifyResult = msg.Content
+			}
+			continue
+		}
+		if businessResult == "" {
+			businessResult = msg.Content
+		}
+	}
+
+	if businessResult != "" {
+		return fmt.Sprintf("根据系统查询结果：%s\n\n如需进一步帮助，请告诉我。", businessResult)
+	}
+	if classifyResult != "" {
+		return fmt.Sprintf("已识别您的意图：%s\n\n如需进一步帮助，请告诉我。", classifyResult)
 	}
 	return fmt.Sprintf("您好，我是京东智能客服（模拟模式）。已收到您的问题：「%s」。", lastUser)
 }

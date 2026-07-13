@@ -157,7 +157,7 @@ graph TD
 │  │  (Model)     │  │  (Orch.)     │  │  (Security)  │    │
 │  │              │  │              │  │              │    │
 │  │  OpenAI      │  │  Team        │  │  权限         │    │
-│  │  DeepSeek    │  │  Workflow    │  │  脱敏         │    │
+│  │  Anthropic   │  │  Workflow    │  │  脱敏         │    │
 │  └──────────────┘  └──────────────┘  └──────────────┘    │
 │                                                          │
 │  ┌──────────────────────────────────────────────────┐    │
@@ -234,8 +234,8 @@ mkdir -p src/internal/orchestrator  # 编排引擎
 mkdir -p src/internal/mcpclient # MCP 协议
 mkdir -p src/internal/security  # 安全体系
 mkdir -p src/internal/harness   # Harness 组装
-mkdir -p src/internal/examples/jd_cs  # 京东客服
-mkdir -p src/cmd/jd-cs-service  # 可运行入口
+mkdir -p src/examples/jd_cs              # 京东客服示例
+mkdir -p src/examples/cmd/jd-cs-service  # 可运行入口
 ```
 
 ### 1.4.2 初始化 Go 模块
@@ -263,16 +263,18 @@ go-harness-tutorial/
 │   │   ├── orchestrator/← 编排
 │   │   ├── mcpclient/   ← MCP 客户端
 │   │   ├── security/    ← 安全
-│   │   ├── harness/     ← 组装
-│   │   └── examples/jd_cs/ ← 京东客服
-│   └── cmd/             ← 可执行入口
+│   │   └── harness/     ← 组装
+│   └── examples/        ← 示例（与 internal 解耦）
+│       ├── jd_cs/       ← 京东客服业务代码
+│       ├── cmd/jd-cs-service/ ← 可运行入口
+│       └── config.example.json
 └── README.md
 ```
 
 这种结构遵循 Go 项目的标准布局：
 - `internal/` 目录确保这些包不会被外部项目导入（Go 编译器强制）
 - `pkg/` 目录存放可能被外部引用的类型
-- `cmd/` 目录存放可执行文件的 main 函数
+- `examples/` 存放演示代码与可执行入口，不放入 `internal`
 
 ---
 

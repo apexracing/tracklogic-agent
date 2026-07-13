@@ -131,7 +131,7 @@ type Agent struct {
 
 **为什么 Agent 持有 Model 接口而非具体实现？**
 
-这是**策略模式**——Agent 不关心底层是 OpenAI 还是 DeepSeek，只依赖 `model.Model` 接口。这带来了两个好处：
+这是**策略模式**——Agent 不关心底层是 OpenAI 还是 Anthropic，只依赖 `model.Model` 接口。这带来了两个好处：
 1. 在 Team 模式下可以动态替换 Model（模型继承）
 2. 测试时可以注入 MockModel，无需真实 API 调用
 

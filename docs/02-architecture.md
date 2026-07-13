@@ -27,7 +27,7 @@
 │  (Engine) │  (Tool)   │ (Memory)  │  (Model)  │  (Orch.)     │
 │           │           │           │           │              │
 │  Agent    │  Registry │  Buffer   │  OpenAI   │  Team        │
-│  Run Loop │  Execute  │  Summary  │  DeepSeek │  Workflow    │
+│  Run Loop │  Execute  │  Summary  │  Anthropic│  Workflow    │
 ├──────────┴───────────┴───────────┴───────────┴───────────────┤
 │                        安全体系 (Security)                     │
 │  权限管理  |  Prompt 注入检测  |  PII 脱敏  |  路径校验         │
@@ -54,7 +54,7 @@ graph TB
         ENG["运行时引擎<br/>Agent.Run()"]
         TOOL["工具层<br/>Registry + Execute"]
         MEM["记忆子系统<br/>BufferMemory"]
-        MOD["模型集成<br/>OpenAI / DeepSeek"]
+        MOD["模型集成<br/>OpenAI / Anthropic"]
         ORCH["编排引擎<br/>Team + Workflow"]
     end
     
@@ -335,9 +335,10 @@ func DefaultConfig() Config {
 		Name:           "MiniHarness-Go",
 		LogLevel:       "info",
 		DefaultModel: ModelConfig{
-			Provider: "openai",
-			ModelID:  "gpt-4o-mini",
-			Timeout:  60,
+			Vendor:    "openai",
+			APIFormat: "openai_response",
+			ModelID:   "gpt-4o-mini",
+			Timeout:   60,
 		},
 		MemoryConfig: MemoryConfig{
 			Type:     "buffer",
@@ -393,9 +394,9 @@ internal/model    internal/memory    internal/tool
             ↑                 │
     internal/harness ─────────┘
             ↑
-    internal/examples/jd_cs
+    examples/jd_cs
             ↑
-    cmd/jd-cs-service
+    examples/cmd/jd-cs-service
 ```
 
 ```mermaid
@@ -412,8 +413,8 @@ graph TB
     MCP["internal/mcpclient<br/>MCP 客户端"]
     SEC["internal/security<br/>安全体系"]
     HARNESS["internal/harness<br/>组装门面"]
-    JDCS["internal/examples/jd_cs<br/>京东客服"]
-    MAIN["cmd/jd-cs-service<br/>入口"]
+    JDCS["examples/jd_cs<br/>京东客服"]
+    MAIN["examples/cmd/jd-cs-service<br/>入口"]
     
     TYPES --> MODEL
     TYPES --> MEMORY

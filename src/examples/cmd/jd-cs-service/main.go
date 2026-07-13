@@ -6,45 +6,50 @@ import (
 	"log/slog"
 	"os"
 
+	"go-harness-tutorial/examples/jd_cs"
 	"go-harness-tutorial/internal/engine"
-	"go-harness-tutorial/internal/examples/jd_cs"
 	"go-harness-tutorial/internal/harness"
 	"go-harness-tutorial/internal/security"
 )
 
+// 写死加载的配置文件（相对运行目录：请在 src/ 下执行 go run）
+const configFile = "examples/config.example.json"
+
 func main() {
 	slog.Info("京东智能客服系统启动中...")
 
-	cfg := harness.DefaultConfig()
+	cfg, err := harness.LoadConfig(configFile)
+	if err != nil {
+		slog.Error("failed to load config", "path", configFile, "error", err)
+		os.Exit(1)
+	}
+
 	cfg.Name = "JD-CS-Service"
-	cfg.LogLevel = "info"
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "info"
+	}
 	cfg.PermissionMode = "strict"
 
-	cfg.DefaultModel = harness.ModelConfig{
-		Provider: "openai",
-		ModelID:  "gpt-4o-mini",
-		Timeout:  60,
+	harness.ResolveModelDefaults(&cfg.DefaultModel)
+
+	// api_key 为空时回退 mock，便于本地无 Key 演示
+	if cfg.DefaultModel.APIFormat != "mock" && cfg.DefaultModel.APIKey == "" {
+		slog.Warn("api_key empty — falling back to mock",
+			"vendor", cfg.DefaultModel.Vendor,
+			"api_format", cfg.DefaultModel.APIFormat)
+		cfg.DefaultModel.APIFormat = "mock"
+		if cfg.DefaultModel.ModelID == "" {
+			cfg.DefaultModel.ModelID = "mock-jd-cs"
+		}
 	}
 
-	cfg.AllowedTools = []string{
-		"calculator", "read_file", "write_file",
-	}
-
-	cfg.Security = harness.SecurityConfig{
-		MaxInputLength:       5000,
-		MaxOutputLength:      20000,
-		EnableInjectionCheck: true,
-		SanitizePII:          true,
-	}
-
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey != "" {
-		cfg.DefaultModel.APIKey = apiKey
-	} else {
-		slog.Warn("OPENAI_API_KEY not set — using mock model for demo")
-		cfg.DefaultModel.Provider = "mock"
-		cfg.DefaultModel.ModelID = "mock-jd-cs"
-	}
+	slog.Info("model config",
+		"vendor", cfg.DefaultModel.Vendor,
+		"api_format", cfg.DefaultModel.APIFormat,
+		"base_url", cfg.DefaultModel.BaseURL,
+		"model_id", cfg.DefaultModel.ModelID,
+		"config", configFile,
+	)
 
 	h, err := harness.New(cfg)
 	if err != nil {
@@ -120,7 +125,7 @@ func runBatchTests(h *harness.Harness) {
 		fmt.Printf("\n▸ 场景 %d [%s]\n", i+1, test.agent)
 		fmt.Printf("  用户: %s\n", test.query)
 
-		output := h.RunAgent(context.Background(), test.agent, test.query, engine.WithMaxLoops(3))
+		output := h.RunAgent(context.Background(), test.agent, test.query, engine.WithMaxLoops(5))
 		if output.Success {
 			fmt.Printf("  客服: %s\n", truncate(output.Content, 300))
 		} else {
