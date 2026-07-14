@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"go-harness-tutorial/internal/tool"
-	"go-harness-tutorial/internal/model"
 	"go-harness-tutorial/internal/memory"
+	"go-harness-tutorial/internal/model"
+	"go-harness-tutorial/internal/tool"
 	"go-harness-tutorial/pkg/types"
 )
 
@@ -95,7 +95,7 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 			Stream:      cfg.streamFunc != nil,
 		}
 
-		resp, err := a.Model.Invoke(ctx, req)
+		resp, err := a.invokeModel(ctx, req, cfg.streamFunc)
 		if err != nil {
 			a.logger.Error("model invoke failed", "error", err)
 			return &RunOutput{Success: false, Error: err.Error(), LoopCount: loopCount}
@@ -142,10 +142,6 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 		a.Memory.Add(assistantMsg)
 		lastContent = resp.Content
 
-		if cfg.streamFunc != nil {
-			cfg.streamFunc(resp.Content)
-		}
-
 		a.logger.Info("agent run completed",
 			"loops", loopCount,
 			"tokens", totalTokens,
@@ -168,6 +164,18 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 		Error:     types.NewError(types.ErrMaxLoopsExceeded, "max loops exceeded").Error(),
 		LoopCount: loopCount,
 	}
+}
+
+// invokeModel calls Invoke or InvokeStream depending on whether a stream callback is set.
+func (a *Agent) invokeModel(ctx context.Context, req *model.InvokeRequest, onChunk func(string)) (*model.InvokeResponse, error) {
+	if onChunk == nil {
+		return a.Model.Invoke(ctx, req)
+	}
+	ch, err := a.Model.InvokeStream(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return consumeStream(ctx, ch, onChunk)
 }
 
 func (a *Agent) buildMessages() []types.Message {

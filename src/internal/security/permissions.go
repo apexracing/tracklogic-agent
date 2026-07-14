@@ -18,9 +18,9 @@ const (
 )
 
 type PermissionManager struct {
-	mu          sync.RWMutex
-	allowList   map[Permission]bool
-	denyList    map[Permission]bool
+	mu        sync.RWMutex
+	allowList map[Permission]bool
+	denyList  map[Permission]bool
 }
 
 func NewPermissionManager() *PermissionManager {
@@ -67,9 +67,9 @@ func (pm *PermissionManager) IsAllowed(perm Permission) bool {
 type Role string
 
 const (
-	RoleAdmin   Role = "admin"
-	RoleUser    Role = "user"
-	RoleGuest   Role = "guest"
+	RoleAdmin Role = "admin"
+	RoleUser  Role = "user"
+	RoleGuest Role = "guest"
 )
 
 var roleDefaults = map[Role][]Permission{
@@ -93,10 +93,12 @@ func (pm *PermissionManager) SetRole(role Role) {
 // RequiredPermission returns the permission needed to invoke a tool, if any.
 func RequiredPermission(toolName string) (Permission, bool) {
 	switch toolName {
-	case "read_file":
+	case "read_file", "list_dir":
 		return PermReadFile, true
 	case "write_file":
 		return PermWriteFile, true
+	case "http_get":
+		return PermNetAccess, true
 	default:
 		if len(toolName) > 4 && toolName[:4] == "mcp_" {
 			return PermNetAccess, true

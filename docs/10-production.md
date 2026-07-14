@@ -112,7 +112,7 @@ func (c ModelConfig) BuildModel() (model.Model, error) {
     "model_id": "gpt-4o-mini",
     "timeout_seconds": 60
   },
-  "allowed_tools": ["calculator", "read_file", "write_file"],
+  "allowed_tools": ["calculator", "read_file", "write_file", "get_current_time", "list_dir", "http_get", "json_parse"],
   "memory": {
     "type": "buffer",
     "capacity": 100
@@ -199,9 +199,13 @@ Harness 的插件机制基于 Go 的接口，不需要复杂的 SPI 或反射：
 func (h *Harness) registerBuiltinTool(name string) {
 	var t tool.Tool
 	switch name {
-	case "calculator": t = builtin.NewCalculator()
-	case "read_file":  t = builtin.NewReadFile(".")
-	case "write_file": t = builtin.NewWriteFile(".")
+	case "calculator":       t = builtin.NewCalculator()
+	case "read_file":        t = builtin.NewReadFile(".")
+	case "write_file":       t = builtin.NewWriteFile(".")
+	case "get_current_time": t = builtin.NewCurrentTime()
+	case "list_dir":         t = builtin.NewListDir(".")
+	case "http_get":         t = builtin.NewHTTPGet()
+	case "json_parse":       t = builtin.NewJSONParse()
 	default:
 		h.logger.Warn("unknown builtin tool", "name", name)
 		return

@@ -410,6 +410,19 @@ func (t *ReadFileTool) safePath(path string) (string, error) {
 
 如果没有此防护，Agent 可能通过 `../../etc/passwd` 读取系统敏感文件。`safePath` 通过计算相对路径并检查是否以 `..` 开头来防止此攻击。
 
+### 4.6.3 其他常用内置工具
+
+除计算器与文件读写外，Harness 还提供以下内置工具（通过 `allowed_tools` 按需启用）：
+
+| 工具名 | 作用 | 关键参数 | 权限 |
+|--------|------|----------|------|
+| `get_current_time` | 获取当前时间（可选 IANA 时区） | `timezone` | 无 |
+| `list_dir` | 列出目录条目（同文件沙箱） | `path` | `read_file` |
+| `http_get` | HTTP GET，默认 10s 超时，正文上限 64KiB | `url`, `timeout_seconds` | `network_access` |
+| `json_parse` | 将 JSON 字符串解析为结构化值 | `text` | 无 |
+
+`list_dir` 与 `read_file` / `write_file` 共用路径穿越防护。`http_get` 在非 2xx 时仍返回 `status` + 截断后的 `body`，由 Agent 自行判断是否重试。
+
 ### 工具类图
 
 ```mermaid
@@ -509,13 +522,13 @@ Agent.Run()
 - 设计并实现了 `Tool` 接口，统一了所有外部能力的调用方式
 - 实现了 `BaseTool` 基类，减少重复代码
 - 实现了线程安全的 `Registry` 工具注册中心
-- 实现了计算器和文件操作两个内置工具
+- 实现了计算器、文件操作、时间、列目录、HTTP GET、JSON 解析等内置工具
 - 建立了路径遍历防护等安全机制
 
 ---
 
 ## 练习
 
-1. 实现 `HTTPGetTool`——允许 Agent 发送 HTTP GET 请求（需要限制允许访问的域名列表）
+1. 为 `http_get` 增加域名 allowlist，并把响应截断上限做成可配置
 2. 为 Registry 添加 `ListByPermission(perm string) []Tool` 方法，方便权限控制
 3. 实现工具结果截断机制：当工具返回超过 2000 字符时，自动截断并添加 `[truncated]` 标记

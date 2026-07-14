@@ -251,15 +251,27 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 		// 2c. 构建工具定义（从 Registry 转换为模型格式）
 		toolDefs := a.buildToolDefinitions()
 
-		// 2d. 调用模型
+		// 2d. 调用模型（有 WithStream 时走 InvokeStream，按 chunk 回调）
 		req := &model.InvokeRequest{
 			Messages:    msgs,
 			Tools:       toolDefs,
 			Temperature: cfg.temperature,
 			MaxTokens:   cfg.maxTokens,
+			Stream:      cfg.streamFunc != nil,
 		}
 
-		resp, err := a.Model.Invoke(ctx, req)
+		var resp *model.InvokeResponse
+		var err error
+		if cfg.streamFunc != nil {
+			ch, streamErr := a.Model.InvokeStream(ctx, req)
+			if streamErr != nil {
+				err = streamErr
+			} else {
+				resp, err = consumeStream(ctx, ch, cfg.streamFunc)
+			}
+		} else {
+			resp, err = a.Model.Invoke(ctx, req)
+		}
 		if err != nil {
 			a.logger.Error("model invoke failed", "error", err)
 			return &RunOutput{
@@ -610,6 +622,6 @@ Agent 注册的工具集在运行期间可能发生变化。如果模型调用�
 ## 练习
 
 1. 给 Agent 添加 `PreRun` 和 `PostRun` 钩子，在 Run 前后执行自定义逻辑
-2. 实现 `WithStream` 选项：当启用时，通过回调函数逐步输出模型内容（而非等待完整结果）
+2. 将 `WithStream` 的回调升级为结构化事件通道（例如区分 content / tool_call / done），便于上层做 SSE
 3. 为 `RunOutput` 添加 `Messages []types.Message` 字段，返回本次运行的所有消息记录
 4. 实现一个简单的 `maxLoops` 检测机制：当连续 3 次调用同一个工具且参数相同时，强制终止

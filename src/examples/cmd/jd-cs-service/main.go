@@ -124,11 +124,14 @@ func runBatchTests(h *harness.Harness) {
 	for i, test := range tests {
 		fmt.Printf("\n▸ 场景 %d [%s]\n", i+1, test.agent)
 		fmt.Printf("  用户: %s\n", test.query)
+		fmt.Print("  客服: ")
 
-		output := h.RunAgent(context.Background(), test.agent, test.query, engine.WithMaxLoops(5))
-		if output.Success {
-			fmt.Printf("  客服: %s\n", truncate(output.Content, 300))
-		} else {
+		output := h.RunAgent(context.Background(), test.agent, test.query,
+			engine.WithMaxLoops(5),
+			engine.WithStream(func(chunk string) { fmt.Print(chunk) }),
+		)
+		fmt.Println()
+		if !output.Success {
 			fmt.Printf("  ✗ 失败: %s\n", output.Error)
 		}
 	}

@@ -149,7 +149,7 @@ if cfg.DefaultModel.APIFormat != "mock" && cfg.DefaultModel.APIKey == "" {
 
 engine.Agent 将 Memory 中的 types.Message 转为 InvokeRequest.Messages，把 Registry 中的工具转为 ToolDefinition。模型返回 ToolCall 时，引擎执行工具并把结果写回 Memory，进入下一轮 Invoke。
 
-流式路径：InvokeStream 返回 <-chan ResponseChunk，可按 chunk 拼接内容或转发给上层（本教程 Demo 以非流式为主）。
+流式路径：传入 `engine.WithStream(fn)` 时，Agent 调用 `InvokeStream`，由 `consumeStream` 按 chunk 拼接 content / 合并增量 ToolCall，并把非空文本立即转发给 `fn`。`Run` 仍同步返回完整 `RunOutput`。Demo 批处理（`jd-cs-service`）通过 `WithStream` 边收边打印 token。
 
 ---
 

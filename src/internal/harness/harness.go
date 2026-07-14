@@ -36,15 +36,15 @@ type Harness struct {
 
 func New(cfg Config) (*Harness, error) {
 	h := &Harness{
-		Config:          cfg,
-		ToolRegistry:    tool.NewRegistry(),
-		PermissionMgr:   security.NewPermissionManager(),
-		Sanitizer:       security.NewSanitizer(),
-		MCPClients:      make(map[string]*mcpclient.Client),
-		Agents:          make(map[string]*engine.Agent),
-		Teams:           make(map[string]*orchestrator.Team),
-		Workflows:       make(map[string]*orchestrator.Workflow),
-		logger:          slog.With("component", "harness"),
+		Config:        cfg,
+		ToolRegistry:  tool.NewRegistry(),
+		PermissionMgr: security.NewPermissionManager(),
+		Sanitizer:     security.NewSanitizer(),
+		MCPClients:    make(map[string]*mcpclient.Client),
+		Agents:        make(map[string]*engine.Agent),
+		Teams:         make(map[string]*orchestrator.Team),
+		Workflows:     make(map[string]*orchestrator.Workflow),
+		logger:        slog.With("component", "harness"),
 	}
 
 	h.setupLogger(cfg.LogLevel)
@@ -121,6 +121,14 @@ func (h *Harness) registerBuiltinTool(name string) {
 		t = builtin.NewReadFile(".")
 	case "write_file":
 		t = builtin.NewWriteFile(".")
+	case "get_current_time":
+		t = builtin.NewCurrentTime()
+	case "list_dir":
+		t = builtin.NewListDir(".")
+	case "http_get":
+		t = builtin.NewHTTPGet()
+	case "json_parse":
+		t = builtin.NewJSONParse()
 	default:
 		h.logger.Warn("unknown builtin tool", "name", name)
 		return
