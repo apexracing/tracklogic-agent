@@ -3,6 +3,7 @@ package security
 import (
 	"regexp"
 	"strings"
+	"sync"
 )
 
 var (
@@ -12,8 +13,14 @@ var (
 	creditCardPattern = regexp.MustCompile(`\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}`)
 )
 
-type Sanitizer struct {
+type Sanitizer interface {
+	Sanitize(input string) string
+}
+
+// RuleSanitizer is the default regular-expression based Sanitizer.
+type RuleSanitizer struct {
 	rules []SanitizeRule
+	mu    sync.RWMutex
 }
 
 type SanitizeRule struct {
@@ -22,13 +29,13 @@ type SanitizeRule struct {
 	Replace func(string) string
 }
 
-func NewSanitizer() *Sanitizer {
-	s := &Sanitizer{}
+func NewSanitizer() *RuleSanitizer {
+	s := &RuleSanitizer{}
 	s.addDefaultRules()
 	return s
 }
 
-func (s *Sanitizer) addDefaultRules() {
+func (s *RuleSanitizer) addDefaultRules() {
 	s.rules = []SanitizeRule{
 		{
 			Name:    "phone",
@@ -75,7 +82,9 @@ func (s *Sanitizer) addDefaultRules() {
 	}
 }
 
-func (s *Sanitizer) Sanitize(input string) string {
+func (s *RuleSanitizer) Sanitize(input string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	result := input
 	for _, rule := range s.rules {
 		result = rule.Pattern.ReplaceAllStringFunc(result, rule.Replace)
@@ -83,6 +92,8 @@ func (s *Sanitizer) Sanitize(input string) string {
 	return result
 }
 
-func (s *Sanitizer) AddRule(rule SanitizeRule) {
+func (s *RuleSanitizer) AddRule(rule SanitizeRule) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.rules = append(s.rules, rule)
 }

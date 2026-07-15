@@ -1,11 +1,12 @@
-package jd_cs
+package jdcs
 
 import (
 	agent "github.com/apexracing/tracklogic-agent"
+	"github.com/apexracing/tracklogic-agent/engine"
 	"github.com/apexracing/tracklogic-agent/tool"
 )
 
-func SetupAgents(h *agent.Harness) (*agent.Agent, *agent.Agent, *agent.Agent, error) {
+func SetupAgents(h *agent.Harness) (*engine.Agent, *engine.Agent, *engine.Agent, error) {
 	triageTool := NewIntentClassifierTool()
 	if err := h.RegisterTool(triageTool); err != nil {
 		return nil, nil, nil, err

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	agent "github.com/apexracing/tracklogic-agent"
+	"github.com/apexracing/tracklogic-agent/engine"
 )
 
 func TestRealModelFromEnvironment(t *testing.T) {
@@ -36,7 +37,7 @@ func TestRealModelFromEnvironment(t *testing.T) {
 
 	// Reasoning models may spend part of the output budget on a thinking block
 	// before emitting the final text, so keep this smoke-test budget practical.
-	result := runtimeAgent.Run(ctx, "回复：连接成功", agent.WithMaxLoops(1), agent.WithMaxTokens(512))
+	result := runtimeAgent.Run(ctx, "回复：连接成功", engine.WithMaxLoops(1), engine.WithMaxTokens(512))
 	if !result.Success {
 		t.Fatalf("real API request failed: %s", result.Error)
 	}

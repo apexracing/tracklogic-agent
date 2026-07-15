@@ -298,11 +298,11 @@ const (
 type Node interface {
 	ID() string                                    // 节点唯一标识
 	Type() NodeType                                // 节点类型
-	Execute(ctx context.Context, input string, state map[string]any) (string, error)
+	Execute(ctx context.Context, input string, state *State) (string, error)
 }
 ```
 
-**state 参数**：Workflow 通过 `state map[string]any` 在节点间共享数据。例如条件节点的判断结果可以通过 state 传递给后续节点。
+**state 参数**：Workflow 通过并发安全的 `State` 在节点间共享数据。使用 `Get`、`Set` 和 `Snapshot` 访问，避免 ParallelNode 读写裸 map 时产生竞态。
 
 ### 8.3.2 四种节点实现
 
@@ -314,7 +314,7 @@ type StepNode struct {
 	Agent *engine.Agent
 }
 
-func (n *StepNode) Execute(ctx context.Context, input string, state map[string]any) (string, error) {
+func (n *StepNode) Execute(ctx context.Context, input string, state *State) (string, error) {
 	output := n.Agent.Run(ctx, input)
 	if !output.Success {
 		return "", fmt.Errorf("step %s failed: %s", n.id, output.Error)
@@ -328,12 +328,12 @@ func (n *StepNode) Execute(ctx context.Context, input string, state map[string]a
 ```go
 type ConditionNode struct {
 	id         string
-	Condition  func(input string, state map[string]any) (bool, error)
+	Condition  func(input string, state *State) (bool, error)
 	TrueNode   Node
 	FalseNode  Node
 }
 
-func (n *ConditionNode) Execute(ctx context.Context, input string, state map[string]any) (string, error) {
+func (n *ConditionNode) Execute(ctx context.Context, input string, state *State) (string, error) {
 	result, err := n.Condition(input, state)
 	if err != nil { return "", err }
 	if result { return n.TrueNode.Execute(ctx, input, state) }
@@ -349,11 +349,11 @@ func (n *ConditionNode) Execute(ctx context.Context, input string, state map[str
 type LoopNode struct {
 	id         string
 	BodyNode   Node
-	Condition  func(iteration int, input string, state map[string]any) (bool, error)
+	Condition  func(iteration int, input string, state *State) (bool, error)
 	MaxIter    int
 }
 
-func (n *LoopNode) Execute(ctx context.Context, input string, state map[string]any) (string, error) {
+func (n *LoopNode) Execute(ctx context.Context, input string, state *State) (string, error) {
 	current := input
 	for i := 0; i < n.MaxIter; i++ {
 		shouldContinue, err := n.Condition(i, current, state)
@@ -375,7 +375,7 @@ type ParallelNode struct {
 	Nodes []Node
 }
 
-func (n *ParallelNode) Execute(ctx context.Context, input string, state map[string]any) (string, error) {
+func (n *ParallelNode) Execute(ctx context.Context, input string, state *State) (string, error) {
 	type nodeResult struct { output string; err error }
 	results := make([]nodeResult, len(n.Nodes))
 	var wg sync.WaitGroup
@@ -406,16 +406,18 @@ func (n *ParallelNode) Execute(ctx context.Context, input string, state map[stri
 
 ```go
 type Workflow struct {
-	ID     string
-	Name   string
-	Nodes  []Node          // 顺序执行的节点序列
-	State  map[string]any  // 工作流状态（跨节点共享）
-	logger *slog.Logger
+	ID           string
+	Name         string
+	Nodes        []Node
+	initialState *State // 每次运行从初始状态复制
+	logger       *slog.Logger
 }
 
 func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 	start := time.Now()
 	current := input
+	state := NewState(w.initialState.Snapshot())
+	state.Set("user_input", input)
 
 	for _, node := range w.Nodes {
 		select {
@@ -427,7 +429,7 @@ func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 		default:
 		}
 
-		output, err := node.Execute(ctx, current, w.State)
+		output, err := node.Execute(ctx, current, state)
 		if err != nil {
 			return &WorkflowResult{
 				Output: current, Success: false,
@@ -440,6 +442,7 @@ func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 	return &WorkflowResult{
 		Output:   current,
 		Success:  true,
+		State:    state.Snapshot(),
 		Duration: time.Since(start),
 	}
 }
@@ -448,20 +451,21 @@ func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 ### 8.3.4 构建 Workflow 示例
 
 ```go
-wf := orchestrator.NewWorkflow(orchestrator.WorkflowConfig{
+wf := workflow.NewWorkflow(workflow.WorkflowConfig{
 	ID:   "customer-service",
 	Name: "智能客服工作流",
 })
 
 // 构建节点
-classify := orchestrator.NewStepNode("classify", triageAgent)
-handleQuery := orchestrator.NewStepNode("handle", orderAgent)
-transfer := orchestrator.NewStepNode("transfer", orderAgent)
+classify := workflow.NewStepNode("classify", triageAgent)
+handleQuery := workflow.NewStepNode("handle", orderAgent)
+transfer := workflow.NewStepNode("transfer", orderAgent)
 
 // 条件判断：是否转人工
-route := orchestrator.NewConditionNode("route",
-	func(input string, state map[string]any) (bool, error) {
-		intent := state["intent"].(string)
+route := workflow.NewConditionNode("route",
+	func(input string, state *workflow.State) (bool, error) {
+		value, _ := state.Get("intent")
+		intent, _ := value.(string)
 		return intent == "refund", nil
 	},
 	handleQuery,  // 需要退款 → 订单处理

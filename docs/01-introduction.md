@@ -226,10 +226,10 @@ mkdir docs
 
 # 公共库与示例目录
 mkdir -p types engine model memory
-mkdir -p tool/builtin orchestrator security
-mkdir -p internal/mcpclient
-mkdir -p examples/jd_cs
-mkdir -p examples/cmd/jd-cs-service
+mkdir -p tool/builtin workflow security
+mkdir -p mcp
+mkdir -p examples/jdcs
+mkdir -p cmd/jd-cs-service
 ```
 
 ### 1.4.2 初始化 Go 模块
@@ -250,25 +250,26 @@ tracklogic-agent/
 ├── model/               ← 模型集成
 ├── memory/              ← 记忆
 ├── tool/                ← 工具层与 builtin
-├── orchestrator/        ← Team 与 Workflow
+├── workflow/           ← Team 与 Workflow
 ├── security/            ← 安全体系
-├── internal/mcpclient/  ← 非公开 MCP 客户端
-├── examples/            ← 京东客服示例与入口
+├── mcp/                 ← 公共 MCP 客户端
+├── examples/jdcs/       ← 京东客服业务示例
+├── cmd/jd-cs-service/   ← 示例程序入口
 ├── docs/                ← 教程文档（13 章）
 └── README.md
 ```
 
 这种结构遵循 Go 项目的标准布局：
-- 根包 `agent` 提供最常用的创建和运行入口
-- 公共子包提供 Model、Tool、Memory 和编排扩展接口
-- `internal/` 只保留不承诺兼容性的 MCP 实现细节
-- `examples/` 存放演示代码与可执行入口
+- 根包 `agent` 只提供 Harness、配置和依赖注入 façade，不重复导出子包类型
+- 公共子包提供 Model、Tool、Memory、Engine、Security、Workflow 和 MCP 扩展接口
+- `types/` 只保存确实被多个底层包共享的稳定协议类型
+- `examples/` 存放业务示例，`cmd/` 存放可执行入口
 
 ---
 
 ## 1.5 定义核心类型
 
-核心类型是所有子系统的共享基础。它们定义在公开的 `types/` 包中。
+跨层协议类型是多个子系统的共享基础，定义在公开的 `types/` 包中；领域配置和结果仍归所属包管理。
 
 ### 1.5.1 消息模型（message.go）
 
@@ -418,6 +419,15 @@ type RunContext struct {
 	WorkflowID  string         `json:"workflow_id,omitempty"`
 	ParentRunID string         `json:"parent_run_id,omitempty"`
 	Metadata    map[string]any `json:"metadata,omitempty"`
+}
+
+func WithRunContext(parent context.Context, runContext *RunContext) context.Context {
+	return context.WithValue(parent, ctxKey{}, runContext)
+}
+
+func RunContextFrom(ctx context.Context) (*RunContext, bool) {
+	runContext, ok := ctx.Value(ctxKey{}).(*RunContext)
+	return runContext, ok && runContext != nil
 }
 ```
 

@@ -1,4 +1,4 @@
-package orchestrator
+package workflow
 
 import (
 	"context"
@@ -23,17 +23,54 @@ const (
 type Node interface {
 	ID() string
 	Type() NodeType
-	Execute(ctx context.Context, input string, state map[string]any) (string, error)
+	Execute(ctx context.Context, input string, state *State) (string, error)
+}
+
+// State is the concurrency-safe state shared by nodes within one workflow run.
+type State struct {
+	mu     sync.RWMutex
+	values map[string]any
+}
+
+func NewState(initial map[string]any) *State {
+	state := &State{values: make(map[string]any, len(initial))}
+	for key, value := range initial {
+		state.values[key] = value
+	}
+	return state
+}
+
+func (s *State) Set(key string, value any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.values[key] = value
+}
+
+func (s *State) Get(key string) (any, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	value, ok := s.values[key]
+	return value, ok
+}
+
+func (s *State) Snapshot() map[string]any {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make(map[string]any, len(s.values))
+	for key, value := range s.values {
+		result[key] = value
+	}
+	return result
 }
 
 type StepNode struct {
 	id            string
 	Agent         *engine.Agent
-	AfterExecute  func(input, output string, state map[string]any)
+	AfterExecute  func(input, output string, state *State)
 	InputStateKey string
 }
 
-func NewStepNode(id string, agent *engine.Agent, after ...func(input, output string, state map[string]any)) *StepNode {
+func NewStepNode(id string, agent *engine.Agent, after ...func(input, output string, state *State)) *StepNode {
 	n := &StepNode{id: id, Agent: agent}
 	if len(after) > 0 {
 		n.AfterExecute = after[0]
@@ -49,11 +86,14 @@ func (n *StepNode) WithInputFromState(key string) *StepNode {
 func (n *StepNode) ID() string     { return n.id }
 func (n *StepNode) Type() NodeType { return NodeTypeStep }
 
-func (n *StepNode) Execute(ctx context.Context, input string, state map[string]any) (string, error) {
+func (n *StepNode) Execute(ctx context.Context, input string, state *State) (string, error) {
 	agentInput := input
 	if n.InputStateKey != "" && state != nil {
-		if v, ok := state[n.InputStateKey].(string); ok && v != "" {
-			agentInput = v
+		if value, exists := state.Get(n.InputStateKey); exists {
+			v, ok := value.(string)
+			if ok && v != "" {
+				agentInput = v
+			}
 		}
 	}
 	output := n.Agent.Run(ctx, agentInput)
@@ -68,12 +108,12 @@ func (n *StepNode) Execute(ctx context.Context, input string, state map[string]a
 
 type ConditionNode struct {
 	id        string
-	Condition func(input string, state map[string]any) (bool, error)
+	Condition func(input string, state *State) (bool, error)
 	TrueNode  Node
 	FalseNode Node
 }
 
-func NewConditionNode(id string, condition func(input string, state map[string]any) (bool, error), trueNode, falseNode Node) *ConditionNode {
+func NewConditionNode(id string, condition func(input string, state *State) (bool, error), trueNode, falseNode Node) *ConditionNode {
 	return &ConditionNode{
 		id: id, Condition: condition,
 		TrueNode: trueNode, FalseNode: falseNode,
@@ -83,7 +123,7 @@ func NewConditionNode(id string, condition func(input string, state map[string]a
 func (n *ConditionNode) ID() string     { return n.id }
 func (n *ConditionNode) Type() NodeType { return NodeTypeCondition }
 
-func (n *ConditionNode) Execute(ctx context.Context, input string, state map[string]any) (string, error) {
+func (n *ConditionNode) Execute(ctx context.Context, input string, state *State) (string, error) {
 	result, err := n.Condition(input, state)
 	if err != nil {
 		return "", fmt.Errorf("condition %s error: %w", n.id, err)
@@ -100,11 +140,11 @@ func (n *ConditionNode) Execute(ctx context.Context, input string, state map[str
 type LoopNode struct {
 	id        string
 	BodyNode  Node
-	Condition func(iteration int, input string, state map[string]any) (bool, error)
+	Condition func(iteration int, input string, state *State) (bool, error)
 	MaxIter   int
 }
 
-func NewLoopNode(id string, body Node, condition func(int, string, map[string]any) (bool, error), maxIter int) *LoopNode {
+func NewLoopNode(id string, body Node, condition func(int, string, *State) (bool, error), maxIter int) *LoopNode {
 	if maxIter <= 0 {
 		maxIter = 10
 	}
@@ -114,7 +154,7 @@ func NewLoopNode(id string, body Node, condition func(int, string, map[string]an
 func (n *LoopNode) ID() string     { return n.id }
 func (n *LoopNode) Type() NodeType { return NodeTypeLoop }
 
-func (n *LoopNode) Execute(ctx context.Context, input string, state map[string]any) (string, error) {
+func (n *LoopNode) Execute(ctx context.Context, input string, state *State) (string, error) {
 	current := input
 	for i := 0; i < n.MaxIter; i++ {
 		select {
@@ -150,7 +190,7 @@ func NewParallelNode(id string, nodes ...Node) *ParallelNode {
 func (n *ParallelNode) ID() string     { return n.id }
 func (n *ParallelNode) Type() NodeType { return NodeTypeParallel }
 
-func (n *ParallelNode) Execute(ctx context.Context, input string, state map[string]any) (string, error) {
+func (n *ParallelNode) Execute(ctx context.Context, input string, state *State) (string, error) {
 	type nodeResult struct {
 		output string
 		err    error
@@ -180,11 +220,11 @@ func (n *ParallelNode) Execute(ctx context.Context, input string, state map[stri
 }
 
 type Workflow struct {
-	ID     string
-	Name   string
-	Nodes  []Node
-	State  map[string]any
-	logger *slog.Logger
+	ID           string
+	Name         string
+	Nodes        []Node
+	initialState *State
+	logger       *slog.Logger
 }
 
 type WorkflowConfig struct {
@@ -194,10 +234,10 @@ type WorkflowConfig struct {
 
 func NewWorkflow(cfg WorkflowConfig) *Workflow {
 	return &Workflow{
-		ID:     cfg.ID,
-		Name:   cfg.Name,
-		State:  make(map[string]any),
-		logger: slog.With("component", "workflow", "name", cfg.Name),
+		ID:           cfg.ID,
+		Name:         cfg.Name,
+		initialState: NewState(nil),
+		logger:       slog.With("component", "workflow", "name", cfg.Name),
 	}
 }
 
@@ -226,7 +266,8 @@ func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 	start := time.Now()
 	w.logger.Info("workflow started", "nodes", len(w.Nodes))
 
-	w.State["user_input"] = input
+	state := NewState(w.initialState.Snapshot())
+	state.Set("user_input", input)
 	current := input
 	var stepLogs []StepLog
 
@@ -235,7 +276,7 @@ func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 		case <-ctx.Done():
 			return &WorkflowResult{
 				Output: current, Success: false, Error: "workflow cancelled",
-				State: w.State, Duration: time.Since(start), StepLogs: stepLogs,
+				State: state.Snapshot(), Duration: time.Since(start), StepLogs: stepLogs,
 			}
 		default:
 		}
@@ -243,7 +284,7 @@ func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 		stepStart := time.Now()
 		w.logger.Info("executing node", "id", node.ID(), "type", node.Type())
 
-		output, err := node.Execute(ctx, current, w.State)
+		output, err := node.Execute(ctx, current, state)
 		duration := time.Since(stepStart)
 
 		if err != nil {
@@ -254,7 +295,7 @@ func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 			})
 			return &WorkflowResult{
 				Output: current, Success: false, Error: fmt.Sprintf("node %s failed: %s", node.ID(), err),
-				State: w.State, Duration: time.Since(start), StepLogs: stepLogs,
+				State: state.Snapshot(), Duration: time.Since(start), StepLogs: stepLogs,
 			}
 		}
 
@@ -268,15 +309,14 @@ func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 	w.logger.Info("workflow completed", "duration", time.Since(start))
 	return &WorkflowResult{
 		Output: current, Success: true,
-		State: w.State, Duration: time.Since(start), StepLogs: stepLogs,
+		State: state.Snapshot(), Duration: time.Since(start), StepLogs: stepLogs,
 	}
 }
 
 func (w *Workflow) SetState(key string, value any) {
-	w.State[key] = value
+	w.initialState.Set(key, value)
 }
 
 func (w *Workflow) GetState(key string) (any, bool) {
-	v, ok := w.State[key]
-	return v, ok
+	return w.initialState.Get(key)
 }

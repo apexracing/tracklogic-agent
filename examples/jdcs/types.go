@@ -1,4 +1,4 @@
-package jd_cs
+package jdcs
 
 import "time"
 

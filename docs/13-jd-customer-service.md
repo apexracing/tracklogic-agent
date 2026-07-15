@@ -439,26 +439,26 @@ func SetupAgents(h *harness.Harness) (*engine.Agent, *engine.Agent, *engine.Agen
 ## 13.6 Workflow 售后处理流程
 
 ```go
-func BuildAfterSalesWorkflow(orderAgent, refundAgent *engine.Agent) *orchestrator.Workflow {
-	wf := orchestrator.NewWorkflow(orchestrator.WorkflowConfig{
+func BuildAfterSalesWorkflow(orderAgent, refundAgent *engine.Agent) *workflow.Workflow {
+	wf := workflow.NewWorkflow(workflow.WorkflowConfig{
 		ID:   "after-sales",
 		Name: "售后处理工作流",
 	})
 
 	// 步骤 1: 验证订单
-	verifyOrder := orchestrator.NewStepNode("verify_order", orderAgent)
+	verifyOrder := workflow.NewStepNode("verify_order", orderAgent)
 
 	// 步骤 2: 处理退款
-	processRefund := orchestrator.NewStepNode("process_refund", refundAgent)
+	processRefund := workflow.NewStepNode("process_refund", refundAgent)
 
 	// 条件判断：是否需要补偿
-	needsCompensation := orchestrator.NewConditionNode("needs_compensation",
-		func(input string, state map[string]any) (bool, error) {
-			needs := state["needs_compensation"]
+	needsCompensation := workflow.NewConditionNode("needs_compensation",
+		func(input string, state *workflow.State) (bool, error) {
+			needs, _ := state.Get("needs_compensation")
 			return fmt.Sprintf("%v", needs) == "true", nil
 		},
-		orchestrator.NewStepNode("compensation", orderAgent),  // true: 发优惠券
-		orchestrator.NewStepNode("done", orderAgent),          // false: 完成
+		workflow.NewStepNode("compensation", orderAgent),  // true: 发优惠券
+		workflow.NewStepNode("done", orderAgent),          // false: 完成
 	)
 
 	wf.AddNode(verifyOrder)
@@ -479,17 +479,20 @@ cfg.Security.SanitizePII = true          // 开启 PII 脱敏
 cfg.Security.EnableInjectionCheck = true  // 开启注入检测
 cfg.PermissionMode = "strict"             // 严格权限模式
 
-// PII 脱敏规则
-h.Sanitizer.AddRule(security.SanitizeRule{
+// PII 脱敏规则：先扩展默认实现，再注入 Harness
+sanitizer := security.NewSanitizer()
+sanitizer.AddRule(security.SanitizeRule{
 	Name:    "phone",
 	Pattern: regexp.MustCompile(`1[3-9]\d{9}`),
 	Replace: func(m string) string {
 		return m[:3] + "****" + m[7:]
 	},
 })
+h, err := agent.New(cfg, agent.WithSanitizer(sanitizer))
+if err != nil { return err }
 
 // 设置权限
-h.PermissionMgr.Allow(security.PermReadFile, security.PermNetAccess)
+h.AllowPermissions(security.PermReadFile, security.PermNetAccess)
 ```
 
 ### 安全集成流程图

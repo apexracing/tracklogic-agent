@@ -101,7 +101,7 @@ func (c ModelConfig) BuildModel() (model.Model, error) {
 
 ```json
 {
-  "version": "1.0.0",
+  "version": "0.2.0",
   "name": "JD-CS-Production",
   "log_level": "info",
   "default_model": {
@@ -210,14 +210,14 @@ func (h *Harness) registerBuiltinTool(name string) {
 		h.logger.Warn("unknown builtin tool", "name", name)
 		return
 	}
-	if err := h.ToolRegistry.Register(t); err != nil {
+	if err := h.RegisterTool(t); err != nil {
 		h.logger.Warn("failed to register tool", "name", name, "error", err)
 	}
 }
 
 // 外部工具注册（通过 API）
 func (h *Harness) RegisterTool(t tool.Tool) error {
-	return h.ToolRegistry.Register(t)
+	return h.toolRegistry.Register(t)
 }
 ```
 

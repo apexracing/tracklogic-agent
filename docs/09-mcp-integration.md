@@ -195,7 +195,7 @@ func (c *Client) Initialize(ctx context.Context) error {
 		ProtocolVersion: "2025-03-26",
 		ClientInfo: Implementation{
 			Name:    "tracklogic-agent",
-			Version: "1.0.0",
+			Version: "0.2.0",
 		},
 	}
 
@@ -301,7 +301,7 @@ func (c *Client) call(ctx context.Context, method string, params any) (*Response
 ```go
 type mcpToolAdapter struct {
 	name   string
-	client *mcpclient.Client
+	client *mcp.Client
 	defs   []model.ToolDefinition
 }
 
@@ -331,7 +331,7 @@ func (h *Harness) InitMCPClients(ctx context.Context) error {
 		tools, err := client.ToToolDefinitions(ctx)
 		if err != nil { return err }
 		mcpTool := &mcpToolAdapter{name, client, tools}
-		h.ToolRegistry.Register(mcpTool)
+		if err := h.RegisterTool(mcpTool); err != nil { return err }
 	}
 	return nil
 }

@@ -198,24 +198,25 @@ type Security interface {
 ### 2.3.1 Harness 结构体定义
 
 ```go
-package harness
+package agent
 
 type Harness struct {
-	Config          Config
-	Model           model.Model
-	ToolRegistry    *tool.Registry
-	Memory          memory.Memory
-	PermissionMgr   *security.PermissionManager
-	InputValidator  *security.InputValidator
-	OutputValidator *security.OutputValidator
-	Sanitizer       *security.Sanitizer
-	MCPClients      map[string]*mcpclient.Client
-	Agents          map[string]*engine.Agent
-	Teams           map[string]*orchestrator.Team
-	Workflows       map[string]*orchestrator.Workflow
-	logger          *slog.Logger
+	config            Config
+	model             model.Model
+	toolRegistry      *tool.Registry
+	permissionManager security.PermissionManager
+	inputValidator    security.InputValidator
+	outputValidator   security.OutputValidator
+	sanitizer         security.Sanitizer
+	mcpClients        map[string]*mcp.Client
+	agents            map[string]*engine.Agent
+	teams             map[string]*workflow.Team
+	workflows         map[string]*workflow.Workflow
+	mu                 sync.RWMutex
 }
 ```
+
+这些字段属于实现细节。消费者通过 `RegisterTool`、`Agent`、`Team`、`Workflow` 和运行方法访问能力，而不是直接修改映射或安全组件。
 
 **为什么是门面模式？**
 
@@ -239,7 +240,7 @@ func (h *Harness) RunAgent(ctx context.Context, name, input string, opts ...engi
 	}
 
 	// 步骤 3：查找 Agent
-	agent, ok := h.Agents[name]
+	runtimeAgent, ok := h.Agent(name)
 	if !ok {
 		return &engine.RunOutput{
 			Success: false,
@@ -248,10 +249,13 @@ func (h *Harness) RunAgent(ctx context.Context, name, input string, opts ...engi
 	}
 
 	// 步骤 4：执行 Agent
-	output := agent.Run(ctx, sanitizedInput, opts...)
+	output := runtimeAgent.Run(ctx, sanitizedInput, opts...)
 
 	// 步骤 5：输出脱敏
-	if h.Config.Security.SanitizePII && output.Success {
+	if output.Success {
+		if err := h.ValidateOutput(output.Content); err != nil {
+			return &engine.RunOutput{Success: false, Error: err.Error()}
+		}
 		output.Content = h.Sanitize(output.Content)
 	}
 
@@ -262,18 +266,18 @@ func (h *Harness) RunAgent(ctx context.Context, name, input string, opts ...engi
 ### 2.3.3 New() 构造函数
 
 ```go
-func New(cfg Config) (*Harness, error) {
+func New(cfg Config, options ...Option) (*Harness, error) {
 	h := &Harness{
-		Config:          cfg,
-		ToolRegistry:    tool.NewRegistry(),
-		PermissionMgr:   security.NewPermissionManager(),
-		InputValidator:  security.NewInputValidator(),
-		OutputValidator: security.NewOutputValidator(),
-		Sanitizer:       security.NewSanitizer(),
-		MCPClients:      make(map[string]*mcpclient.Client),
-		Agents:          make(map[string]*engine.Agent),
-		Teams:           make(map[string]*orchestrator.Team),
-		Workflows:       make(map[string]*orchestrator.Workflow),
+		config:            cfg,
+		toolRegistry:      tool.NewRegistry(),
+		permissionManager: security.NewPermissionManager(),
+		inputValidator:    security.NewInputValidator(),
+		outputValidator:   security.NewOutputValidator(),
+		sanitizer:         security.NewSanitizer(),
+		mcpClients:        make(map[string]*mcp.Client),
+		agents:            make(map[string]*engine.Agent),
+		teams:             make(map[string]*workflow.Team),
+		workflows:         make(map[string]*workflow.Workflow),
 	}
 
 	// 设置日志级别
@@ -284,17 +288,11 @@ func New(cfg Config) (*Harness, error) {
 	if err != nil {
 		return nil, fmt.Errorf("build model: %w", err)
 	}
-	h.Model = model
-
-	// 初始化记忆
-	switch cfg.MemoryConfig.Type {
-	case "buffer":
-		h.Memory = memory.NewBufferMemory(cfg.MemoryConfig.Capacity)
-	}
+	h.model = model
 
 	// 设置权限模式
 	if cfg.PermissionMode == "strict" {
-		h.PermissionMgr.SetRole(security.RoleUser)
+		h.permissionManager.SetRole(security.RoleUser)
 	}
 
 	// 注册内置工具
@@ -331,8 +329,8 @@ type Config struct {
 ```go
 func DefaultConfig() Config {
 	return Config{
-		Version:        "1.0.0",
-		Name:           "MiniHarness-Go",
+		Version:        "0.2.0",
+		Name:           "tracklogic-agent",
 		LogLevel:       "info",
 		DefaultModel: ModelConfig{
 			Vendor:    "openai",
@@ -381,9 +379,9 @@ func LoadConfig(path string) (Config, error) {
 types ← model / memory
 model ← tool
 model + memory + tool ← engine
-engine + model ← orchestrator
-model ← internal/mcpclient
-以上公开包 + internal/mcpclient ← 根包 agent
+engine + model ← workflow
+model ← mcp
+以上公开包 + mcp ← 根包 agent
 根包 agent + 公开扩展包 ← examples
 ```
 
@@ -397,12 +395,12 @@ graph TB
     BUILTIN["tool/builtin<br/>内置工具"]
     
     ENGINE["engine<br/>运行时引擎"]
-    ORCH["orchestrator<br/>编排引擎"]
-    MCP["internal/mcpclient<br/>MCP 客户端"]
+    ORCH["workflow<br/>编排引擎"]
+    MCP["mcp<br/>MCP 客户端"]
     SEC["security<br/>安全体系"]
     HARNESS["agent<br/>根包组装门面"]
-    JDCS["examples/jd_cs<br/>京东客服"]
-    MAIN["examples/cmd/jd-cs-service<br/>入口"]
+    JDCS["examples/jdcs<br/>京东客服"]
+    MAIN["cmd/jd-cs-service<br/>入口"]
     
     MODEL --> TYPES
     MEMORY --> TYPES
@@ -434,7 +432,7 @@ graph TB
 - `types` 位于最底层，不依赖其他项目包
 - 上层可以依赖下层，下层不能依赖上层
 - 根包 `agent` 是组装中心，依赖所有子系统
-- 应用示例（`jd_cs`）依赖根包和公开扩展包，但库不依赖任何示例
+- 应用示例（`jdcs`）依赖根包和公开扩展包，但库不依赖任何示例
 
 ---
 

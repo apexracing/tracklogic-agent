@@ -1,4 +1,4 @@
-package mcpclient
+package mcp
 
 import (
 	"bufio"
@@ -49,7 +49,7 @@ func (c *Client) Initialize(ctx context.Context) error {
 		Capabilities:    ClientCapabilities{},
 		ClientInfo: Implementation{
 			Name:    "tracklogic-agent",
-			Version: "1.0.0",
+			Version: "0.2.0",
 		},
 	}
 
@@ -210,6 +210,23 @@ func (r *jsonReader) Read(p []byte) (int, error) {
 type ServerStream struct {
 	reader *bufio.Reader
 	closer io.Closer
+}
+
+// ReadLine reads the next raw SSE line from the server stream.
+func (stream *ServerStream) ReadLine() (string, error) {
+	if stream == nil || stream.reader == nil {
+		return "", fmt.Errorf("server stream is not initialized")
+	}
+	line, err := stream.reader.ReadString('\n')
+	return strings.TrimRight(line, "\r\n"), err
+}
+
+// Close releases the underlying SSE response body.
+func (stream *ServerStream) Close() error {
+	if stream == nil || stream.closer == nil {
+		return nil
+	}
+	return stream.closer.Close()
 }
 
 func (c *Client) SSEStream(ctx context.Context) (*ServerStream, error) {

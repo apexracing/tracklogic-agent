@@ -1,10 +1,10 @@
 {
-  "version": "1.0.0",
+  "version": "0.2.0",
   "name": "JD-CS-Service",
   "log_level": "info",
   "default_model": {
     "vendor": "deepseek",
-    "api_format": "anthropic_message ",
+    "api_format": "anthropic_message",
     "base_url": "https://api.deepseek.com/anthropic",
     "api_key": "",
     "model_id": "deepseek-v4-flash",

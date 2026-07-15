@@ -87,7 +87,7 @@ func (c ModelConfig) BuildModel() (model.Model, error) {
 }
 ```
 
-Harness.New() 在启动时调用 cfg.DefaultModel.BuildModel() 并注入 Harness.Model。ResolveModelDefaults 会规范化 vendor/api_format 大小写并补默认超时，**不**推断 BaseURL。
+Harness.New() 在启动时调用 cfg.DefaultModel.BuildModel() 并注入私有默认模型。ResolveModelDefaults 会规范化 vendor/api_format 大小写并补默认超时，**不**推断 BaseURL；需要查看默认模型时使用 `h.Model()`。
 
 DefaultConfig() 默认：
 
@@ -110,8 +110,8 @@ Demo 使用的完整配置在 `examples/config.example.json`：
 {
   "default_model": {
     "vendor": "deepseek",
-    "api_format": "openai_chat_completions",
-    "base_url": "https://api.deepseek.com/v1",
+    "api_format": "anthropic_message",
+    "base_url": "https://api.deepseek.com/anthropic",
     "api_key": "",
     "model_id": "deepseek-v4-flash",
     "timeout_seconds": 60
@@ -119,22 +119,22 @@ Demo 使用的完整配置在 `examples/config.example.json`：
 }
 ```
 
-填写有效 api_key 并保持 api_format 为 openai_chat_completions 即可走 DeepSeek；改为 anthropic_message 并设置 Anthropic 的 base_url / model_id 即可切换协议。
+示例使用 DeepSeek 提供的 Anthropic Messages 兼容端点。真实 Key 不写入 JSON，而由 `TRACKLOGIC_AGENT_API_KEY` 在进程启动时覆盖。
 
 ---
 
 ## 6.5 Demo 硬编码加载
 
-入口位于 `examples/cmd/jd-cs-service/main.go`：
+入口位于 `cmd/jd-cs-service/main.go`：
 
 ```go
 const configFile = "examples/config.example.json"
 
-cfg, err := harness.LoadConfig(configFile)
+cfg, err := agent.LoadConfig(configFile)
 if apiKey := strings.TrimSpace(os.Getenv("TRACKLOGIC_AGENT_API_KEY")); apiKey != "" {
 	cfg.DefaultModel.APIKey = apiKey
 }
-harness.ResolveModelDefaults(&cfg.DefaultModel)
+agent.ResolveModelDefaults(&cfg.DefaultModel)
 if cfg.DefaultModel.APIFormat != "mock" && cfg.DefaultModel.APIKey == "" {
 	cfg.DefaultModel.APIFormat = "mock"
 }
@@ -143,7 +143,7 @@ if cfg.DefaultModel.APIFormat != "mock" && cfg.DefaultModel.APIKey == "" {
 要点：
 
 1. **无** `-config` 命令行参数和通用 `MODEL_*` 环境变量；真实测试只允许用 `TRACKLOGIC_AGENT_API_KEY` 覆盖 Key。
-2. 必须在**仓库根目录**执行 `go run ./examples/cmd/jd-cs-service`，使相对路径 `examples/config.example.json` 可解析。
+2. 必须在**仓库根目录**执行 `go run ./cmd/jd-cs-service`，使相对路径 `examples/config.example.json` 可解析。
 3. LoadConfig 采用「先 DefaultConfig 再 JSON 覆盖」；文件缺失时打 warn 并使用默认值。
 
 ---

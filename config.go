@@ -55,8 +55,8 @@ type SecurityConfig struct {
 
 func DefaultConfig() Config {
 	return Config{
-		Version:  "1.0.0",
-		Name:     "MiniHarness-Go",
+		Version:  "0.2.0",
+		Name:     "tracklogic-agent",
 		LogLevel: "info",
 		DefaultModel: ModelConfig{
 			Vendor:    "openai",

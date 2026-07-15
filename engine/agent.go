@@ -16,14 +16,13 @@ import (
 
 type Agent struct {
 	mu                  sync.RWMutex
-	ID                  string
-	Name                string
-	SystemPrompt        string
-	Model               model.Model
-	ToolRegistry        *tool.Registry
-	Memory              memory.Memory
-	MaxLoops            int
-	CheckToolPermission func(toolName string) error
+	name                string
+	systemPrompt        string
+	model               model.Model
+	toolRegistry        *tool.Registry
+	memory              memory.Memory
+	maxLoops            int
+	checkToolPermission func(toolName string) error
 	logger              *slog.Logger
 }
 
@@ -35,32 +34,60 @@ func NewAgent(cfg AgentConfig) *Agent {
 		cfg.Memory = memory.NewBufferMemory(50)
 	}
 	return &Agent{
-		Name:                cfg.Name,
-		SystemPrompt:        cfg.SystemPrompt,
-		Model:               cfg.Model,
-		ToolRegistry:        cfg.ToolRegistry,
-		Memory:              cfg.Memory,
-		MaxLoops:            cfg.MaxLoops,
-		CheckToolPermission: cfg.CheckToolPermission,
+		name:                cfg.Name,
+		systemPrompt:        cfg.SystemPrompt,
+		model:               cfg.Model,
+		toolRegistry:        cfg.ToolRegistry,
+		memory:              cfg.Memory,
+		maxLoops:            cfg.MaxLoops,
+		checkToolPermission: cfg.CheckToolPermission,
 		logger:              slog.With("component", "agent", "name", cfg.Name),
 	}
+}
+
+func (a *Agent) Name() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.name
+}
+
+func (a *Agent) SystemPrompt() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.systemPrompt
+}
+
+func (a *Agent) Model() model.Model {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.model
+}
+
+func (a *Agent) SetModel(m model.Model) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.model = m
 }
 
 func (a *Agent) SetSystemPrompt(prompt string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.SystemPrompt = prompt
+	a.systemPrompt = prompt
 }
 
 func (a *Agent) AddSystemMessage(content string) {
-	a.Memory.Add(types.Message{Role: types.RoleSystem, Content: content, CreatedAt: time.Now()})
+	a.mu.RLock()
+	mem := a.memory
+	a.mu.RUnlock()
+	mem.Add(types.Message{Role: types.RoleSystem, Content: content, CreatedAt: time.Now()})
 }
 
 func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOutput {
 	cfg := &runConfig{
-		maxLoops:    a.MaxLoops,
+		maxLoops:    a.defaultMaxLoops(),
 		temperature: 0.7,
 		maxTokens:   4096,
+		model:       a.Model(),
 	}
 	for _, opt := range opts {
 		opt(cfg)
@@ -69,7 +96,10 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 	start := time.Now()
 	a.logger.Info("agent run started", "input", truncate(input, 100))
 
-	a.Memory.Add(types.Message{Role: types.RoleUser, Content: input, CreatedAt: time.Now()})
+	a.mu.RLock()
+	mem := a.memory
+	a.mu.RUnlock()
+	mem.Add(types.Message{Role: types.RoleUser, Content: input, CreatedAt: time.Now()})
 
 	var lastContent string
 	totalTokens := 0
@@ -95,7 +125,7 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 			Stream:      cfg.streamFunc != nil,
 		}
 
-		resp, err := a.invokeModel(ctx, req, cfg.streamFunc)
+		resp, err := invokeModel(ctx, cfg.model, req, cfg.streamFunc)
 		if err != nil {
 			a.logger.Error("model invoke failed", "error", err)
 			return &RunOutput{Success: false, Error: err.Error(), LoopCount: loopCount}
@@ -113,7 +143,7 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 
 		if len(resp.ToolCalls) > 0 {
 			assistantMsg.ToolCalls = resp.ToolCalls
-			a.Memory.Add(assistantMsg)
+			mem.Add(assistantMsg)
 
 			for _, tc := range resp.ToolCalls {
 				a.logger.Info("executing tool", "tool", tc.Function.Name)
@@ -132,14 +162,14 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 					Name:       tc.Function.Name,
 					CreatedAt:  time.Now(),
 				}
-				a.Memory.Add(toolMsg)
+				mem.Add(toolMsg)
 			}
 
 			continue
 		}
 
 		assistantMsg.Content = resp.Content
-		a.Memory.Add(assistantMsg)
+		mem.Add(assistantMsg)
 		lastContent = resp.Content
 
 		a.logger.Info("agent run completed",
@@ -150,7 +180,7 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 
 		return &RunOutput{
 			Content:     lastContent,
-			Messages:    a.Memory.Snapshot(),
+			Messages:    mem.Snapshot(),
 			Success:     true,
 			TotalTokens: totalTokens,
 			LoopCount:   loopCount,
@@ -167,11 +197,14 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 }
 
 // invokeModel calls Invoke or InvokeStream depending on whether a stream callback is set.
-func (a *Agent) invokeModel(ctx context.Context, req *model.InvokeRequest, onChunk func(string)) (*model.InvokeResponse, error) {
-	if onChunk == nil {
-		return a.Model.Invoke(ctx, req)
+func invokeModel(ctx context.Context, runModel model.Model, req *model.InvokeRequest, onChunk func(string)) (*model.InvokeResponse, error) {
+	if runModel == nil {
+		return nil, types.NewError(types.ErrInvalidConfig, "agent model is required")
 	}
-	ch, err := a.Model.InvokeStream(ctx, req)
+	if onChunk == nil {
+		return runModel.Invoke(ctx, req)
+	}
+	ch, err := runModel.InvokeStream(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -179,8 +212,12 @@ func (a *Agent) invokeModel(ctx context.Context, req *model.InvokeRequest, onChu
 }
 
 func (a *Agent) buildMessages() []types.Message {
-	msgs := a.Memory.Snapshot()
-	if a.SystemPrompt != "" {
+	a.mu.RLock()
+	mem := a.memory
+	systemPrompt := a.systemPrompt
+	a.mu.RUnlock()
+	msgs := mem.Snapshot()
+	if systemPrompt != "" {
 		hasSystem := false
 		for _, m := range msgs {
 			if m.Role == types.RoleSystem {
@@ -191,7 +228,7 @@ func (a *Agent) buildMessages() []types.Message {
 		if !hasSystem {
 			systemMsg := types.Message{
 				Role:      types.RoleSystem,
-				Content:   a.SystemPrompt,
+				Content:   systemPrompt,
 				CreatedAt: time.Now(),
 			}
 			return append([]types.Message{systemMsg}, msgs...)
@@ -201,10 +238,13 @@ func (a *Agent) buildMessages() []types.Message {
 }
 
 func (a *Agent) buildToolDefinitions() []model.ToolDefinition {
-	if a.ToolRegistry == nil {
+	a.mu.RLock()
+	registry := a.toolRegistry
+	a.mu.RUnlock()
+	if registry == nil {
 		return nil
 	}
-	tools := a.ToolRegistry.List()
+	tools := registry.List()
 	defs := make([]model.ToolDefinition, 0, len(tools))
 	for _, t := range tools {
 		defs = append(defs, t.Definition())
@@ -213,17 +253,21 @@ func (a *Agent) buildToolDefinitions() []model.ToolDefinition {
 }
 
 func (a *Agent) executeToolCall(ctx context.Context, tc types.ToolCall) (string, error) {
-	if a.ToolRegistry == nil {
+	a.mu.RLock()
+	registry := a.toolRegistry
+	checkPermission := a.checkToolPermission
+	a.mu.RUnlock()
+	if registry == nil {
 		return "", types.NewError(types.ErrToolError, "no tool registry configured")
 	}
 
-	t, ok := a.ToolRegistry.Get(tc.Function.Name)
+	t, ok := registry.Get(tc.Function.Name)
 	if !ok {
 		return "", types.NewError(types.ErrToolError, fmt.Sprintf("tool %q not found", tc.Function.Name))
 	}
 
-	if a.CheckToolPermission != nil {
-		if err := a.CheckToolPermission(tc.Function.Name); err != nil {
+	if checkPermission != nil {
+		if err := checkPermission(tc.Function.Name); err != nil {
 			return "", types.WrapError(types.ErrSecurityViolation, "tool permission denied", err)
 		}
 	}
@@ -248,6 +292,12 @@ func (a *Agent) executeToolCall(ctx context.Context, tc types.ToolCall) (string,
 	}
 
 	return string(resultJSON), nil
+}
+
+func (a *Agent) defaultMaxLoops() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.maxLoops
 }
 
 func truncate(s string, n int) string {

@@ -9,83 +9,89 @@ import (
 	"time"
 
 	"github.com/apexracing/tracklogic-agent/engine"
-	"github.com/apexracing/tracklogic-agent/internal/mcpclient"
+	"github.com/apexracing/tracklogic-agent/mcp"
 	"github.com/apexracing/tracklogic-agent/memory"
 	"github.com/apexracing/tracklogic-agent/model"
-	"github.com/apexracing/tracklogic-agent/orchestrator"
 	"github.com/apexracing/tracklogic-agent/security"
 	"github.com/apexracing/tracklogic-agent/tool"
 	"github.com/apexracing/tracklogic-agent/tool/builtin"
+	"github.com/apexracing/tracklogic-agent/workflow"
 )
 
 type Harness struct {
-	mu              sync.RWMutex
-	Config          Config
-	Model           model.Model
-	ToolRegistry    *tool.Registry
-	Memory          memory.Memory
-	memoryCapacity  int
-	PermissionMgr   *security.PermissionManager
-	InputValidator  *security.InputValidator
-	OutputValidator *security.OutputValidator
-	Sanitizer       *security.Sanitizer
-	mcpClients      map[string]*mcpclient.Client
-	Agents          map[string]*engine.Agent
-	Teams           map[string]*orchestrator.Team
-	Workflows       map[string]*orchestrator.Workflow
-	logger          *slog.Logger
+	mu                sync.RWMutex
+	config            Config
+	model             model.Model
+	toolRegistry      *tool.Registry
+	memoryCapacity    int
+	permissionManager security.PermissionManager
+	inputValidator    security.InputValidator
+	outputValidator   security.OutputValidator
+	sanitizer         security.Sanitizer
+	mcpClients        map[string]*mcp.Client
+	agents            map[string]*engine.Agent
+	teams             map[string]*workflow.Team
+	workflows         map[string]*workflow.Workflow
+	logger            *slog.Logger
 }
 
-func New(cfg Config) (*Harness, error) {
+func New(cfg Config, options ...Option) (*Harness, error) {
+	deps := harnessOptions{
+		permissionManager: security.NewPermissionManager(),
+		inputValidator: security.NewInputValidatorWithConfig(
+			cfg.Security.MaxInputLength,
+			cfg.Security.EnableInjectionCheck,
+		),
+		outputValidator: security.NewOutputValidatorWithMaxLength(cfg.Security.MaxOutputLength),
+		sanitizer:       security.NewSanitizer(),
+	}
+	for _, option := range options {
+		if option != nil {
+			option(&deps)
+		}
+	}
+	if deps.permissionManager == nil || deps.inputValidator == nil || deps.outputValidator == nil || deps.sanitizer == nil {
+		return nil, fmt.Errorf("security dependencies must not be nil")
+	}
+
 	h := &Harness{
-		Config:        cfg,
-		ToolRegistry:  tool.NewRegistry(),
-		PermissionMgr: security.NewPermissionManager(),
-		Sanitizer:     security.NewSanitizer(),
-		mcpClients:    make(map[string]*mcpclient.Client),
-		Agents:        make(map[string]*engine.Agent),
-		Teams:         make(map[string]*orchestrator.Team),
-		Workflows:     make(map[string]*orchestrator.Workflow),
-		logger:        slog.With("component", "harness"),
+		config:            cfg,
+		toolRegistry:      tool.NewRegistry(),
+		permissionManager: deps.permissionManager,
+		inputValidator:    deps.inputValidator,
+		outputValidator:   deps.outputValidator,
+		sanitizer:         deps.sanitizer,
+		mcpClients:        make(map[string]*mcp.Client),
+		agents:            make(map[string]*engine.Agent),
+		teams:             make(map[string]*workflow.Team),
+		workflows:         make(map[string]*workflow.Workflow),
+		logger:            slog.With("component", "harness"),
 	}
 
 	h.setupLogger(cfg.LogLevel)
 
-	m, err := cfg.DefaultModel.BuildModel()
+	runtimeModel, err := cfg.DefaultModel.BuildModel()
 	if err != nil {
 		return nil, fmt.Errorf("build model: %w", err)
 	}
-	h.Model = m
+	h.model = runtimeModel
 
 	capacity := cfg.MemoryConfig.Capacity
 	if capacity <= 0 {
 		capacity = 50
 	}
 	h.memoryCapacity = capacity
-	switch cfg.MemoryConfig.Type {
-	case "buffer":
-		h.Memory = memory.NewBufferMemory(capacity)
-	default:
-		h.Memory = memory.NewBufferMemory(capacity)
-	}
-
-	h.InputValidator = security.NewInputValidatorWithConfig(
-		cfg.Security.MaxInputLength,
-		cfg.Security.EnableInjectionCheck,
-	)
-	h.OutputValidator = security.NewOutputValidatorWithMaxLength(cfg.Security.MaxOutputLength)
 
 	if cfg.PermissionMode == "strict" {
-		h.PermissionMgr.SetRole(security.RoleUser)
+		h.permissionManager.SetRole(security.RoleUser)
 	}
 
-	for _, mcpCfg := range cfg.MCPClients {
-		timeout := time.Duration(mcpCfg.Timeout) * time.Second
+	for _, mcpConfig := range cfg.MCPClients {
+		timeout := time.Duration(mcpConfig.Timeout) * time.Second
 		if timeout <= 0 {
 			timeout = 30 * time.Second
 		}
-		client := mcpclient.NewClient(mcpCfg.BaseURL, timeout)
-		h.mcpClients[mcpCfg.Name] = client
+		h.mcpClients[mcpConfig.Name] = mcp.NewClient(mcpConfig.BaseURL, timeout)
 	}
 
 	for _, toolName := range cfg.AllowedTools {
@@ -95,145 +101,186 @@ func New(cfg Config) (*Harness, error) {
 	return h, nil
 }
 
+func (h *Harness) Config() Config {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.config
+}
+
+func (h *Harness) Model() model.Model {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.model
+}
+
+func (h *Harness) ToolRegistry() *tool.Registry { return h.toolRegistry }
+
 func (h *Harness) setupLogger(level string) {
-	var lvl slog.Level
+	var configuredLevel slog.Level
 	switch level {
 	case "debug":
-		lvl = slog.LevelDebug
-	case "info":
-		lvl = slog.LevelInfo
+		configuredLevel = slog.LevelDebug
 	case "warn":
-		lvl = slog.LevelWarn
+		configuredLevel = slog.LevelWarn
 	case "error":
-		lvl = slog.LevelError
+		configuredLevel = slog.LevelError
 	default:
-		lvl = slog.LevelInfo
+		configuredLevel = slog.LevelInfo
 	}
-	opts := &slog.HandlerOptions{Level: lvl}
-	handler := slog.NewTextHandler(os.Stdout, opts)
-	slog.SetDefault(slog.New(handler))
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: configuredLevel})))
 }
 
 func (h *Harness) registerBuiltinTool(name string) {
-	var t tool.Tool
+	var runtimeTool tool.Tool
 	switch name {
 	case "calculator":
-		t = builtin.NewCalculator()
+		runtimeTool = builtin.NewCalculator()
 	case "read_file":
-		t = builtin.NewReadFile(".")
+		runtimeTool = builtin.NewReadFile(".")
 	case "write_file":
-		t = builtin.NewWriteFile(".")
+		runtimeTool = builtin.NewWriteFile(".")
 	case "get_current_time":
-		t = builtin.NewCurrentTime()
+		runtimeTool = builtin.NewCurrentTime()
 	case "list_dir":
-		t = builtin.NewListDir(".")
+		runtimeTool = builtin.NewListDir(".")
 	case "http_get":
-		t = builtin.NewHTTPGet()
+		runtimeTool = builtin.NewHTTPGet()
 	case "json_parse":
-		t = builtin.NewJSONParse()
+		runtimeTool = builtin.NewJSONParse()
 	default:
 		h.logger.Warn("unknown builtin tool", "name", name)
 		return
 	}
-	if err := h.ToolRegistry.Register(t); err != nil {
+	if err := h.RegisterTool(runtimeTool); err != nil {
 		h.logger.Warn("failed to register tool", "name", name, "error", err)
 	}
 }
 
-func (h *Harness) RegisterTool(t tool.Tool) error {
-	return h.ToolRegistry.Register(t)
+func (h *Harness) RegisterTool(runtimeTool tool.Tool) error {
+	return h.toolRegistry.Register(runtimeTool)
 }
 
 func (h *Harness) NewAgent(name, systemPrompt string) *engine.Agent {
-	agent := engine.NewAgent(engine.AgentConfig{
+	runtimeAgent := engine.NewAgent(engine.AgentConfig{
 		Name:                name,
 		SystemPrompt:        systemPrompt,
-		Model:               h.Model,
-		ToolRegistry:        h.ToolRegistry,
+		Model:               h.Model(),
+		ToolRegistry:        h.toolRegistry,
 		Memory:              memory.NewBufferMemory(h.memoryCapacity),
 		CheckToolPermission: h.checkToolPermission,
 	})
 	h.mu.Lock()
-	h.Agents[name] = agent
+	h.agents[name] = runtimeAgent
 	h.mu.Unlock()
-	return agent
+	return runtimeAgent
+}
+
+func (h *Harness) RegisterAgent(runtimeAgent *engine.Agent) error {
+	if runtimeAgent == nil || runtimeAgent.Name() == "" {
+		return fmt.Errorf("agent and agent name are required")
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	name := runtimeAgent.Name()
+	if _, exists := h.agents[name]; exists {
+		return fmt.Errorf("agent %q already registered", name)
+	}
+	h.agents[name] = runtimeAgent
+	return nil
+}
+
+func (h *Harness) Agent(name string) (*engine.Agent, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	runtimeAgent, ok := h.agents[name]
+	return runtimeAgent, ok
 }
 
 func (h *Harness) checkToolPermission(toolName string) error {
-	perm, ok := security.RequiredPermission(toolName)
-	if !ok {
+	permission, required := security.RequiredPermission(toolName)
+	if !required {
 		return nil
 	}
-	return h.PermissionMgr.Check(perm)
+	return h.permissionManager.Check(permission)
 }
 
-func (h *Harness) NewTeam(cfg orchestrator.TeamConfig) *orchestrator.Team {
-	team := orchestrator.NewTeam(cfg)
+func (h *Harness) NewTeam(cfg workflow.TeamConfig) *workflow.Team {
+	team := workflow.NewTeam(cfg)
 	h.mu.Lock()
-	h.Teams[cfg.Name] = team
+	h.teams[cfg.Name] = team
 	h.mu.Unlock()
 	return team
 }
 
-func (h *Harness) NewWorkflow(cfg orchestrator.WorkflowConfig) *orchestrator.Workflow {
-	wf := orchestrator.NewWorkflow(cfg)
-	h.mu.Lock()
-	h.Workflows[cfg.Name] = wf
-	h.mu.Unlock()
-	return wf
-}
-
-func (h *Harness) RegisterTeam(team *orchestrator.Team) error {
+func (h *Harness) RegisterTeam(team *workflow.Team) error {
 	if team == nil || team.Name == "" {
 		return fmt.Errorf("team and team name are required")
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if _, exists := h.Teams[team.Name]; exists {
+	if _, exists := h.teams[team.Name]; exists {
 		return fmt.Errorf("team %q already registered", team.Name)
 	}
-	h.Teams[team.Name] = team
+	h.teams[team.Name] = team
 	return nil
 }
 
-func (h *Harness) RegisterWorkflow(workflow *orchestrator.Workflow) error {
-	if workflow == nil || workflow.Name == "" {
+func (h *Harness) Team(name string) (*workflow.Team, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	team, ok := h.teams[name]
+	return team, ok
+}
+
+func (h *Harness) NewWorkflow(cfg workflow.WorkflowConfig) *workflow.Workflow {
+	runtimeWorkflow := workflow.NewWorkflow(cfg)
+	h.mu.Lock()
+	h.workflows[cfg.Name] = runtimeWorkflow
+	h.mu.Unlock()
+	return runtimeWorkflow
+}
+
+func (h *Harness) RegisterWorkflow(runtimeWorkflow *workflow.Workflow) error {
+	if runtimeWorkflow == nil || runtimeWorkflow.Name == "" {
 		return fmt.Errorf("workflow and workflow name are required")
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if _, exists := h.Workflows[workflow.Name]; exists {
-		return fmt.Errorf("workflow %q already registered", workflow.Name)
+	if _, exists := h.workflows[runtimeWorkflow.Name]; exists {
+		return fmt.Errorf("workflow %q already registered", runtimeWorkflow.Name)
 	}
-	h.Workflows[workflow.Name] = workflow
+	h.workflows[runtimeWorkflow.Name] = runtimeWorkflow
 	return nil
 }
 
+func (h *Harness) Workflow(name string) (*workflow.Workflow, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	runtimeWorkflow, ok := h.workflows[name]
+	return runtimeWorkflow, ok
+}
+
 func (h *Harness) AllowPermissions(permissions ...security.Permission) {
-	h.PermissionMgr.Allow(permissions...)
+	h.permissionManager.Allow(permissions...)
 }
 
 func (h *Harness) DenyPermissions(permissions ...security.Permission) {
-	h.PermissionMgr.Deny(permissions...)
+	h.permissionManager.Deny(permissions...)
 }
 
-func (h *Harness) ValidateInput(input string) error {
-	return h.InputValidator.Validate(input)
-}
+func (h *Harness) ValidateInput(input string) error { return h.inputValidator.Validate(input) }
 
-func (h *Harness) ValidateOutput(output string) error {
-	return h.OutputValidator.Validate(output)
-}
+func (h *Harness) ValidateOutput(output string) error { return h.outputValidator.Validate(output) }
 
 func (h *Harness) Sanitize(input string) string {
-	if h.Config.Security.SanitizePII {
-		return h.Sanitizer.Sanitize(input)
+	if h.Config().Security.SanitizePII {
+		return h.sanitizer.Sanitize(input)
 	}
 	return input
 }
 
-func (h *Harness) CheckPermission(perm security.Permission) error {
-	return h.PermissionMgr.Check(perm)
+func (h *Harness) CheckPermission(permission security.Permission) error {
+	return h.permissionManager.Check(permission)
 }
 
 func (h *Harness) InitMCPClients(ctx context.Context) error {
@@ -241,17 +288,13 @@ func (h *Harness) InitMCPClients(ctx context.Context) error {
 		if err := client.Initialize(ctx); err != nil {
 			return fmt.Errorf("initialize MCP client %q: %w", name, err)
 		}
-		tools, err := client.ToToolDefinitions(ctx)
+		definitions, err := client.ToToolDefinitions(ctx)
 		if err != nil {
 			return fmt.Errorf("get tools from MCP client %q: %w", name, err)
 		}
-		for _, def := range tools {
-			adapter := &mcpToolAdapter{
-				clientName: name,
-				client:     client,
-				def:        def,
-			}
-			if err := h.ToolRegistry.Register(adapter); err != nil {
+		for _, definition := range definitions {
+			adapter := &mcpToolAdapter{clientName: name, client: client, definition: definition}
+			if err := h.RegisterTool(adapter); err != nil {
 				h.logger.Warn("failed to register MCP tool", "name", adapter.Name(), "error", err)
 			}
 		}
@@ -259,10 +302,8 @@ func (h *Harness) InitMCPClients(ctx context.Context) error {
 	return nil
 }
 
-func (h *Harness) RunAgent(ctx context.Context, name, input string, opts ...engine.RunOption) *engine.RunOutput {
-	h.mu.RLock()
-	agent, ok := h.Agents[name]
-	h.mu.RUnlock()
+func (h *Harness) RunAgent(ctx context.Context, name, input string, options ...engine.RunOption) *engine.RunOutput {
+	runtimeAgent, ok := h.Agent(name)
 	if !ok {
 		return &engine.RunOutput{Success: false, Error: fmt.Sprintf("agent %q not found", name)}
 	}
@@ -270,86 +311,81 @@ func (h *Harness) RunAgent(ctx context.Context, name, input string, opts ...engi
 	if err := h.ValidateInput(validatedInput); err != nil {
 		return &engine.RunOutput{Success: false, Error: err.Error()}
 	}
-	output := agent.Run(ctx, validatedInput, opts...)
+	output := runtimeAgent.Run(ctx, validatedInput, options...)
 	if output.Success {
 		if err := h.ValidateOutput(output.Content); err != nil {
 			return &engine.RunOutput{Success: false, Error: err.Error(), LoopCount: output.LoopCount}
 		}
-		if h.Config.Security.SanitizePII {
-			output.Content = h.Sanitizer.Sanitize(output.Content)
-		}
+		output.Content = h.Sanitize(output.Content)
 	}
 	return output
 }
 
-func (h *Harness) RunTeam(ctx context.Context, name, input string) *orchestrator.TeamOutput {
-	h.mu.RLock()
-	team, ok := h.Teams[name]
-	h.mu.RUnlock()
+func (h *Harness) RunTeam(ctx context.Context, name, input string) *workflow.TeamOutput {
+	team, ok := h.Team(name)
 	if !ok {
-		return &orchestrator.TeamOutput{Success: false, Error: fmt.Sprintf("team %q not found", name)}
+		return &workflow.TeamOutput{Success: false, Error: fmt.Sprintf("team %q not found", name)}
 	}
 	validatedInput := h.Sanitize(input)
 	if err := h.ValidateInput(validatedInput); err != nil {
-		return &orchestrator.TeamOutput{Success: false, Error: err.Error()}
+		return &workflow.TeamOutput{Success: false, Error: err.Error()}
 	}
 	output := team.Run(ctx, validatedInput)
-	if output.Success && h.Config.Security.SanitizePII {
-		output.FinalOutput = h.Sanitizer.Sanitize(output.FinalOutput)
+	if output.Success {
+		if err := h.ValidateOutput(output.FinalOutput); err != nil {
+			return &workflow.TeamOutput{Success: false, Error: err.Error(), AgentOutputs: output.AgentOutputs}
+		}
+		output.FinalOutput = h.Sanitize(output.FinalOutput)
 	}
 	return output
 }
 
-func (h *Harness) RunWorkflow(ctx context.Context, name, input string) *orchestrator.WorkflowResult {
-	h.mu.RLock()
-	wf, ok := h.Workflows[name]
-	h.mu.RUnlock()
+func (h *Harness) RunWorkflow(ctx context.Context, name, input string) *workflow.WorkflowResult {
+	runtimeWorkflow, ok := h.Workflow(name)
 	if !ok {
-		return &orchestrator.WorkflowResult{Success: false, Error: fmt.Sprintf("workflow %q not found", name)}
+		return &workflow.WorkflowResult{Success: false, Error: fmt.Sprintf("workflow %q not found", name)}
 	}
 	validatedInput := h.Sanitize(input)
 	if err := h.ValidateInput(validatedInput); err != nil {
-		return &orchestrator.WorkflowResult{Success: false, Error: err.Error()}
+		return &workflow.WorkflowResult{Success: false, Error: err.Error()}
 	}
-	result := wf.Run(ctx, validatedInput)
+	result := runtimeWorkflow.Run(ctx, validatedInput)
 	if result.Success {
 		if err := h.ValidateOutput(result.Output); err != nil {
-			return &orchestrator.WorkflowResult{Success: false, Error: err.Error(), State: result.State, StepLogs: result.StepLogs}
+			return &workflow.WorkflowResult{Success: false, Error: err.Error(), State: result.State, StepLogs: result.StepLogs}
 		}
-		if h.Config.Security.SanitizePII {
-			result.Output = h.Sanitizer.Sanitize(result.Output)
-		}
+		result.Output = h.Sanitize(result.Output)
 	}
 	return result
 }
 
-func (h *Harness) Close() error {
-	return nil
-}
+func (h *Harness) Close() error { return nil }
 
 type mcpToolAdapter struct {
 	clientName string
-	client     *mcpclient.Client
-	def        model.ToolDefinition
+	client     *mcp.Client
+	definition model.ToolDefinition
 }
 
-func (m *mcpToolAdapter) Name() string { return "mcp_" + m.clientName + "_" + m.def.Name }
+func (adapter *mcpToolAdapter) Name() string {
+	return "mcp_" + adapter.clientName + "_" + adapter.definition.Name
+}
 
-func (m *mcpToolAdapter) Description() string {
-	if m.def.Description != "" {
-		return m.def.Description
+func (adapter *mcpToolAdapter) Description() string {
+	if adapter.definition.Description != "" {
+		return adapter.definition.Description
 	}
-	return "MCP tool " + m.def.Name + " from " + m.clientName
+	return "MCP tool " + adapter.definition.Name + " from " + adapter.clientName
 }
 
-func (m *mcpToolAdapter) Definition() model.ToolDefinition {
-	def := m.def
-	def.Name = m.Name()
-	return def
+func (adapter *mcpToolAdapter) Definition() model.ToolDefinition {
+	definition := adapter.definition
+	definition.Name = adapter.Name()
+	return definition
 }
 
-func (m *mcpToolAdapter) Validate(args map[string]any) error { return nil }
+func (*mcpToolAdapter) Validate(map[string]any) error { return nil }
 
-func (m *mcpToolAdapter) Execute(ctx context.Context, args map[string]any) (any, error) {
-	return m.client.CallTool(ctx, m.def.Name, args)
+func (adapter *mcpToolAdapter) Execute(ctx context.Context, arguments map[string]any) (any, error) {
+	return adapter.client.CallTool(ctx, adapter.definition.Name, arguments)
 }

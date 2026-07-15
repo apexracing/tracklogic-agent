@@ -17,21 +17,30 @@ var promptInjectionPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)忽略\s*(前面|以上|之前)\s*(的\s*)?(指令|要求|规则|设定)`),
 }
 
-type InputValidator struct {
+type InputValidator interface {
+	Validate(input string) error
+}
+
+type OutputValidator interface {
+	Validate(output string) error
+}
+
+// DefaultInputValidator is the built-in length, injection, and blocked-content validator.
+type DefaultInputValidator struct {
 	maxLength            int
 	blockedWords         []string
 	enableInjectionCheck bool
 }
 
-func NewInputValidator() *InputValidator {
+func NewInputValidator() *DefaultInputValidator {
 	return NewInputValidatorWithConfig(10000, true)
 }
 
-func NewInputValidatorWithConfig(maxLength int, enableInjectionCheck bool) *InputValidator {
+func NewInputValidatorWithConfig(maxLength int, enableInjectionCheck bool) *DefaultInputValidator {
 	if maxLength <= 0 {
 		maxLength = 10000
 	}
-	return &InputValidator{
+	return &DefaultInputValidator{
 		maxLength:            maxLength,
 		enableInjectionCheck: enableInjectionCheck,
 		blockedWords: []string{
@@ -40,7 +49,7 @@ func NewInputValidatorWithConfig(maxLength int, enableInjectionCheck bool) *Inpu
 	}
 }
 
-func (v *InputValidator) Validate(input string) error {
+func (v *DefaultInputValidator) Validate(input string) error {
 	if len(input) == 0 {
 		return fmt.Errorf("empty input")
 	}
@@ -63,22 +72,23 @@ func (v *InputValidator) Validate(input string) error {
 	return nil
 }
 
-type OutputValidator struct {
+// DefaultOutputValidator is the built-in output length validator.
+type DefaultOutputValidator struct {
 	MaxLength int
 }
 
-func NewOutputValidator() *OutputValidator {
+func NewOutputValidator() *DefaultOutputValidator {
 	return NewOutputValidatorWithMaxLength(50000)
 }
 
-func NewOutputValidatorWithMaxLength(maxLength int) *OutputValidator {
+func NewOutputValidatorWithMaxLength(maxLength int) *DefaultOutputValidator {
 	if maxLength <= 0 {
 		maxLength = 50000
 	}
-	return &OutputValidator{MaxLength: maxLength}
+	return &DefaultOutputValidator{MaxLength: maxLength}
 }
 
-func (v *OutputValidator) Validate(output string) error {
+func (v *DefaultOutputValidator) Validate(output string) error {
 	if len(output) > v.MaxLength {
 		return fmt.Errorf("output exceeds max length of %d characters", v.MaxLength)
 	}

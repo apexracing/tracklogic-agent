@@ -8,7 +8,9 @@ import (
 	"strings"
 
 	agent "github.com/apexracing/tracklogic-agent"
-	"github.com/apexracing/tracklogic-agent/examples/jd_cs"
+	"github.com/apexracing/tracklogic-agent/engine"
+	"github.com/apexracing/tracklogic-agent/examples/jdcs"
+	"github.com/apexracing/tracklogic-agent/security"
 )
 
 // 写死加载的配置文件（相对运行目录：请在仓库根目录执行 go run）
@@ -61,16 +63,16 @@ func main() {
 	}
 	defer h.Close()
 
-	h.AllowPermissions(agent.PermReadFile, agent.PermNetAccess)
+	h.AllowPermissions(security.PermReadFile, security.PermNetAccess)
 
 	slog.Info("注册客服组件...")
-	triageAgent, orderAgent, refundAgent, err := jd_cs.SetupAgents(h)
+	triageAgent, orderAgent, refundAgent, err := jdcs.SetupAgents(h)
 	if err != nil {
 		slog.Error("failed to setup agents", "error", err)
 		os.Exit(1)
 	}
 
-	wf := jd_cs.BuildCSWorkflow(triageAgent, orderAgent, refundAgent)
+	wf := jdcs.BuildCSWorkflow(triageAgent, orderAgent, refundAgent)
 	if err := h.RegisterWorkflow(wf); err != nil {
 		slog.Error("failed to register workflow", "error", err)
 		os.Exit(1)
@@ -79,7 +81,7 @@ func main() {
 	slog.Info("京东智能客服系统就绪")
 
 	fmt.Println("\n═══════════════════════════════════════")
-	fmt.Println("  京东智能客服系统 v1.0 — 工作流演示")
+	fmt.Println("  京东智能客服系统 v0.2 — 工作流演示")
 	fmt.Println("═══════════════════════════════════════")
 
 	runWorkflowDemo(h)
@@ -133,8 +135,8 @@ func runBatchTests(h *agent.Harness) {
 		fmt.Print("  客服: ")
 
 		output := h.RunAgent(context.Background(), test.agent, test.query,
-			agent.WithMaxLoops(5),
-			agent.WithStream(func(chunk string) { fmt.Print(chunk) }),
+			engine.WithMaxLoops(5),
+			engine.WithStream(func(chunk string) { fmt.Print(chunk) }),
 		)
 		fmt.Println()
 		if !output.Success {

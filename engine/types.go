@@ -24,6 +24,7 @@ type runConfig struct {
 	streamFunc  func(chunk string)
 	temperature float64
 	maxTokens   int
+	model       model.Model
 }
 
 func WithMaxLoops(n int) RunOption {
@@ -40,6 +41,12 @@ func WithTemperature(t float64) RunOption {
 
 func WithMaxTokens(n int) RunOption {
 	return func(c *runConfig) { c.maxTokens = n }
+}
+
+// WithModel overrides the Agent model for one Run call without mutating the
+// Agent. It is primarily useful for teams that share a model.
+func WithModel(m model.Model) RunOption {
+	return func(c *runConfig) { c.model = m }
 }
 
 type AgentConfig struct {

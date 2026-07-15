@@ -96,13 +96,21 @@ const (
 ### PermissionManager
 
 ```go
-type PermissionManager struct {
+type PermissionManager interface {
+	Allow(...Permission)
+	Deny(...Permission)
+	Check(Permission) error
+	IsAllowed(Permission) bool
+	SetRole(Role)
+}
+
+type ListPermissionManager struct {
 	mu        sync.RWMutex
 	allowList map[Permission]bool
 	denyList  map[Permission]bool
 }
 
-func (pm *PermissionManager) Allow(perms ...Permission) {
+func (pm *ListPermissionManager) Allow(perms ...Permission) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	for _, p := range perms {
@@ -111,7 +119,7 @@ func (pm *PermissionManager) Allow(perms ...Permission) {
 	}
 }
 
-func (pm *PermissionManager) Deny(perms ...Permission) {
+func (pm *ListPermissionManager) Deny(perms ...Permission) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	for _, p := range perms {
@@ -120,7 +128,7 @@ func (pm *PermissionManager) Deny(perms ...Permission) {
 	}
 }
 
-func (pm *PermissionManager) Check(perm Permission) error {
+func (pm *ListPermissionManager) Check(perm Permission) error {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 
@@ -154,7 +162,7 @@ var roleDefaults = map[Role][]Permission{
 	RoleGuest: {PermReadFile},
 }
 
-func (pm *PermissionManager) SetRole(role Role) {
+func (pm *ListPermissionManager) SetRole(role Role) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.allowList = make(map[Permission]bool)
@@ -236,15 +244,20 @@ func (t *ReadFileTool) resolvePath(path string) (string, error) {
 ```go
 func (h *Harness) RunAgent(ctx context.Context, name, input string) *engine.RunOutput {
 	// Layer 1: 输入校验
-	if err := h.InputValidator.Validate(input); err != nil {
+	if err := h.ValidateInput(input); err != nil {
 		return errorOutput(err)
 	}
 
 	// 执行 Agent
-	output := h.Agents[name].Run(ctx, input)
+	runtimeAgent, ok := h.Agent(name)
+	if !ok { return errorOutput(fmt.Errorf("agent %q not found", name)) }
+	output := runtimeAgent.Run(ctx, input)
 
 	// Layer 4: 输出安全
-	if h.Config.Security.SanitizePII && output.Success {
+	if output.Success {
+		if err := h.ValidateOutput(output.Content); err != nil {
+			return errorOutput(err)
+		}
 		output.Content = h.Sanitize(output.Content)
 	}
 	return output

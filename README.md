@@ -1,16 +1,14 @@
 # tracklogic-agent
 
-`tracklogic-agent` 是一个用于构建模型驱动 Agent、工具调用、记忆、Team 和 Workflow 的纯 Go Harness 库。根包 `agent` 提供常用入口；`model`、`memory`、`tool`、`engine`、`orchestrator`、`security` 和 `types` 包提供可替换的扩展接口。
+`tracklogic-agent` 是一个用于构建模型驱动 Agent、工具调用、记忆、Team 和 Workflow 的纯 Go 公共库。根包 `agent` 提供 Harness 与配置入口；`engine`、`model`、`memory`、`tool`、`security`、`types`、`workflow` 和 `mcp` 是职责独立的公共扩展包。
 
-项目同时保留《智能体 Harness 工程指南》的 13 章配套教程和一个可运行的 JD 智能客服示例。
+项目同时包含《智能体 Harness 工程指南》的 13 章教程和一个可运行的 JD 智能客服示例。
 
-## 环境
+## 环境与安装
 
 - Go 1.26 或更高版本
-- 使用真实模型时需要相应供应商的 API 地址、模型 ID 和 API Key
-- 无 API Key 时可以使用内置 Mock 模型完成本地测试
-
-## 安装
+- 使用真实模型时需要供应商 API 地址、模型 ID 和 API Key
+- 无 API Key 时可以使用内置 Mock 模型
 
 ```bash
 go get github.com/apexracing/tracklogic-agent
@@ -27,6 +25,7 @@ import (
     "log"
 
     agent "github.com/apexracing/tracklogic-agent"
+    "github.com/apexracing/tracklogic-agent/engine"
 )
 
 func main() {
@@ -42,8 +41,8 @@ func main() {
 
     assistant := harness.NewAgent("assistant", "你是一个简洁、可靠的助手。")
     result := assistant.Run(context.Background(), "你好",
-        agent.WithMaxLoops(5),
-        agent.WithTemperature(0.2),
+        engine.WithMaxLoops(5),
+        engine.WithTemperature(0.2),
     )
     if !result.Success {
         log.Fatal(result.Error)
@@ -52,15 +51,26 @@ func main() {
 }
 ```
 
-## 扩展接口
+## 公共扩展包
 
-应用可以实现并注入自己的 `model.Model`、`memory.Memory` 和 `tool.Tool`。例如注册自定义工具：
+- `engine`：Agent、执行循环、流式输出和运行选项。
+- `model`：Model 接口及 OpenAI、Chat Completions、Anthropic、Mock 实现。
+- `memory`：Memory 接口和并发安全的 BufferMemory。
+- `tool`、`tool/builtin`：Tool、Registry 和内置工具。
+- `security`：可替换的权限、输入输出校验和脱敏接口。
+- `types`：Message、ToolCall、Usage、RunContext 和结构化错误等跨层协议。
+- `workflow`：Team、Workflow 和各种 Node。
+- `mcp`：可直接使用的公共 MCP 客户端。
+
+创建完全自定义的 Agent：
 
 ```go
 registry := tool.NewRegistry()
-err := registry.Register(myTool)
+if err := registry.Register(myTool); err != nil {
+    return err
+}
 
-runtimeAgent := agent.NewAgent(agent.AgentConfig{
+runtimeAgent := engine.NewAgent(engine.AgentConfig{
     Name:         "custom-agent",
     Model:        myModel,
     Memory:       myMemory,
@@ -68,7 +78,7 @@ runtimeAgent := agent.NewAgent(agent.AgentConfig{
 })
 ```
 
-根包同时导出 Team、Workflow、Node 和常用构造函数；复杂编排也可以直接使用 `orchestrator` 包。
+根包不重复导出这些类型；例如 Team 和 Workflow 使用 `workflow.NewTeam`、`workflow.NewWorkflow` 创建，再通过 Harness 注册和运行。
 
 ## 模型配置
 
@@ -83,42 +93,43 @@ runtimeAgent := agent.NewAgent(agent.AgentConfig{
 
 ## JD 智能客服示例
 
-示例固定读取仓库根目录下的 `examples/config.example.json`。默认示例不保存 API Key；Key 为空时自动回退到 Mock 模型。
-
-真实模型测试时通过进程环境传入 Key，避免修改公开示例：
+示例固定读取仓库根目录下的 `examples/config.example.json`。配置不保存 API Key；Key 为空时自动回退到 Mock 模型。
 
 ```powershell
 $env:TRACKLOGIC_AGENT_API_KEY="<your-api-key>"
-go run ./examples/cmd/jd-cs-service
+go run ./cmd/jd-cs-service
 ```
 
+无真实 Key 时：
+
 ```bash
-go run ./examples/cmd/jd-cs-service
+go run ./cmd/jd-cs-service
 ```
 
 ## 目录结构
 
 ```text
-agent.go, harness.go, config.go   package agent 根公共 API
+agent.go, harness.go, config.go   package agent：Harness 与配置 façade
 engine/                           Agent 运行循环与流式处理
 model/                            模型接口及协议实现
 memory/                           记忆接口与 BufferMemory
 tool/, tool/builtin/              工具接口、注册表与内置工具
-orchestrator/                     Team、Workflow 与 Node
-security/, types/                 安全、权限和共享基础类型
-internal/mcpclient/               内部 MCP 客户端实现
-examples/                         JD 智能客服示例
+security/                         权限、校验与脱敏扩展
+types/                            跨层稳定协议类型
+workflow/                         Team、Workflow 与 Node
+mcp/                              公共 MCP 客户端
+examples/jdcs/                    JD 智能客服业务示例
+cmd/jd-cs-service/                Demo 入口
 docs/                             13 章 Harness 教程
 ```
 
-## 教程
+## 教程与测试
 
-教程从架构、运行时、工具、记忆和模型集成开始，继续覆盖输出治理、编排、MCP、生产可靠性、安全以及完整业务示例。阅读入口为 [docs/01-introduction.md](docs/01-introduction.md)。
-
-## 测试
+教程入口为 [docs/01-introduction.md](docs/01-introduction.md)。
 
 ```bash
 go test ./...
+go test -race ./...
 go vet ./...
 ```
 

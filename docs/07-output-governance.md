@@ -55,13 +55,17 @@ graph TD
 ### 7.2.1 InputValidator
 
 ```go
-type InputValidator struct {
+type InputValidator interface {
+	Validate(input string) error
+}
+
+type DefaultInputValidator struct {
 	maxLength    int           // 最大输入长度
 	blockedWords []string      // 拦截列表
 }
 
-func NewInputValidator() *InputValidator {
-	return &InputValidator{
+func NewInputValidator() *DefaultInputValidator {
+	return &DefaultInputValidator{
 		maxLength:  10000,
 		blockedWords: []string{
 			"<script>", "javascript:", "onerror=", "onload=",
@@ -69,7 +73,7 @@ func NewInputValidator() *InputValidator {
 	}
 }
 
-func (v *InputValidator) Validate(input string) error {
+func (v *DefaultInputValidator) Validate(input string) error {
 	// 检查空输入
 	if len(input) == 0 {
 		return fmt.Errorf("empty input")
@@ -120,15 +124,19 @@ var injectionPatterns = []*regexp.Regexp{
 ### 7.3.1 OutputValidator
 
 ```go
-type OutputValidator struct {
+type OutputValidator interface {
+	Validate(output string) error
+}
+
+type DefaultOutputValidator struct {
 	MaxLength int
 }
 
-func NewOutputValidator() *OutputValidator {
-	return &OutputValidator{MaxLength: 50000}
+func NewOutputValidator() *DefaultOutputValidator {
+	return &DefaultOutputValidator{MaxLength: 50000}
 }
 
-func (v *OutputValidator) Validate(output string) error {
+func (v *DefaultOutputValidator) Validate(output string) error {
 	if len(output) > v.MaxLength {
 		return fmt.Errorf("output exceeds max length of %d characters", v.MaxLength)
 	}
@@ -147,8 +155,13 @@ PII（Personally Identifiable Information）泄露是生产环境中最常见的
 ### 7.4.1 Sanitizer 设计
 
 ```go
-type Sanitizer struct {
+type Sanitizer interface {
+	Sanitize(input string) string
+}
+
+type RuleSanitizer struct {
 	rules []SanitizeRule
+	mu    sync.RWMutex
 }
 
 type SanitizeRule struct {
@@ -157,8 +170,8 @@ type SanitizeRule struct {
 	Replace func(string) string
 }
 
-func NewSanitizer() *Sanitizer {
-	s := &Sanitizer{}
+func NewSanitizer() *RuleSanitizer {
+	s := &RuleSanitizer{}
 	s.addDefaultRules()
 	return s
 }
@@ -167,7 +180,7 @@ func NewSanitizer() *Sanitizer {
 ### 7.4.2 默认脱敏规则
 
 ```go
-func (s *Sanitizer) addDefaultRules() {
+func (s *RuleSanitizer) addDefaultRules() {
 	s.rules = []SanitizeRule{
 		{
 			Name:    "phone",
@@ -220,7 +233,9 @@ func (s *Sanitizer) addDefaultRules() {
 ### 7.4.3 执行脱敏
 
 ```go
-func (s *Sanitizer) Sanitize(input string) string {
+func (s *RuleSanitizer) Sanitize(input string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	result := input
 	for _, rule := range s.rules {
 		result = rule.Pattern.ReplaceAllStringFunc(result, rule.Replace)
@@ -260,7 +275,10 @@ func (h *Harness) RunAgent(ctx context.Context, name, input string) *RunOutput {
 	output := agent.Run(ctx, sanitizedInput)
 
 	// L4: 输出脱敏
-	if h.Config.Security.SanitizePII && output.Success {
+	if output.Success {
+		if err := h.ValidateOutput(output.Content); err != nil {
+			return errorOutput(err)
+		}
 		output.Content = h.Sanitize(output.Content)
 	}
 

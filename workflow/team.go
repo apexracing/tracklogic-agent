@@ -1,4 +1,4 @@
-package orchestrator
+package workflow
 
 import (
 	"context"
@@ -72,16 +72,15 @@ func (t *Team) Run(ctx context.Context, input string) *TeamOutput {
 	}
 }
 
-func (t *Team) applySharedModel(agent *engine.Agent) *engine.Agent {
-	if t.SharedModel == nil || agent == nil {
-		return agent
+func (t *Team) runAgent(ctx context.Context, runtimeAgent *engine.Agent, input string) *engine.RunOutput {
+	if t.SharedModel == nil {
+		return runtimeAgent.Run(ctx, input)
 	}
-	agent.Model = t.SharedModel
-	return agent
+	return runtimeAgent.Run(ctx, input, engine.WithModel(t.SharedModel))
 }
 
 func (t *Team) runSequential(ctx context.Context, input string) *TeamOutput {
-	agents := t.applyAllAgents()
+	agents := append([]*engine.Agent(nil), t.Agents...)
 	if len(agents) == 0 {
 		return &TeamOutput{Success: false, Error: "no agents configured"}
 	}
@@ -90,22 +89,23 @@ func (t *Team) runSequential(ctx context.Context, input string) *TeamOutput {
 	currentInput := input
 
 	for _, agent := range agents {
-		t.logger.Info("sequential: running agent", "agent", agent.Name)
-		output := agent.Run(ctx, currentInput)
-		outputs[agent.Name] = output
+		name := agent.Name()
+		t.logger.Info("sequential: running agent", "agent", name)
+		output := t.runAgent(ctx, agent, currentInput)
+		outputs[name] = output
 
 		if !output.Success {
 			return &TeamOutput{
 				AgentOutputs: outputs,
 				FinalOutput:  output.Content,
 				Success:      false,
-				Error:        fmt.Sprintf("agent %s failed: %s", agent.Name, output.Error),
+				Error:        fmt.Sprintf("agent %s failed: %s", name, output.Error),
 			}
 		}
 		currentInput = output.Content
 	}
 
-	finalOutput := outputs[agents[len(agents)-1].Name].Content
+	finalOutput := outputs[agents[len(agents)-1].Name()].Content
 	return &TeamOutput{
 		AgentOutputs: outputs,
 		FinalOutput:  finalOutput,
@@ -118,14 +118,14 @@ func (t *Team) runParallel(ctx context.Context, input string) *TeamOutput {
 	mu := sync.Mutex{}
 	wg := sync.WaitGroup{}
 
-	for _, agent := range t.applyAllAgents() {
+	for _, agent := range t.Agents {
 		wg.Add(1)
 		a := agent
 		go func() {
 			defer wg.Done()
-			output := a.Run(ctx, input)
+			output := t.runAgent(ctx, a, input)
 			mu.Lock()
-			outputs[a.Name] = output
+			outputs[a.Name()] = output
 			mu.Unlock()
 		}()
 	}
@@ -134,12 +134,13 @@ func (t *Team) runParallel(ctx context.Context, input string) *TeamOutput {
 	var parts []string
 	allSuccess := true
 	for _, agent := range t.Agents {
-		output := outputs[agent.Name]
+		name := agent.Name()
+		output := outputs[name]
 		if output == nil || !output.Success {
 			allSuccess = false
 			continue
 		}
-		parts = append(parts, fmt.Sprintf("**%s**: %s", agent.Name, output.Content))
+		parts = append(parts, fmt.Sprintf("**%s**: %s", name, output.Content))
 	}
 
 	return &TeamOutput{
@@ -156,9 +157,10 @@ func (t *Team) runLeaderFollower(ctx context.Context, input string) *TeamOutput 
 		return &TeamOutput{Success: false, Error: "leader is required for leader_follower mode"}
 	}
 
-	leader := t.applySharedModel(t.Leader)
-	planOutput := leader.Run(ctx, fmt.Sprintf("Plan the approach for: %s\n\nProvide a step-by-step plan.", input))
-	outputs[t.Leader.Name] = planOutput
+	leader := t.Leader
+	leaderName := leader.Name()
+	planOutput := t.runAgent(ctx, leader, fmt.Sprintf("Plan the approach for: %s\n\nProvide a step-by-step plan.", input))
+	outputs[leaderName] = planOutput
 
 	if !planOutput.Success {
 		return &TeamOutput{
@@ -168,17 +170,18 @@ func (t *Team) runLeaderFollower(ctx context.Context, input string) *TeamOutput 
 		}
 	}
 
-	for _, agent := range t.applyAllAgents() {
-		if agent.Name == t.Leader.Name {
+	for _, agent := range t.Agents {
+		name := agent.Name()
+		if name == leaderName {
 			continue
 		}
-		t.logger.Info("follower executing", "agent", agent.Name)
-		followerInput := fmt.Sprintf("Plan: %s\n\nTask: %s\n\nYour role: %s", planOutput.Content, input, agent.SystemPrompt)
-		output := agent.Run(ctx, followerInput)
-		outputs[agent.Name] = output
+		t.logger.Info("follower executing", "agent", name)
+		followerInput := fmt.Sprintf("Plan: %s\n\nTask: %s\n\nYour role: %s", planOutput.Content, input, agent.SystemPrompt())
+		output := t.runAgent(ctx, agent, followerInput)
+		outputs[name] = output
 	}
 
-	synthOutput := leader.Run(ctx, fmt.Sprintf(
+	synthOutput := t.runAgent(ctx, leader, fmt.Sprintf(
 		"Synthesize the following results into a final answer.\n\nOriginal request: %s\n\nResults:\n%s",
 		input, t.formatOutputs(outputs),
 	))
@@ -188,18 +191,6 @@ func (t *Team) runLeaderFollower(ctx context.Context, input string) *TeamOutput 
 		FinalOutput:  synthOutput.Content,
 		Success:      synthOutput.Success,
 	}
-}
-
-func (t *Team) applyAllAgents() []*engine.Agent {
-	result := make([]*engine.Agent, len(t.Agents))
-	copy(result, t.Agents)
-	if t.SharedModel == nil {
-		return result
-	}
-	for i := range result {
-		result[i] = t.applySharedModel(result[i])
-	}
-	return result
 }
 
 func (t *Team) formatOutputs(outputs map[string]*engine.RunOutput) string {

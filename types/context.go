@@ -1,5 +1,7 @@
 package types
 
+import "context"
+
 type RunContext struct {
 	RunID       string
 	SessionID   string
@@ -11,18 +13,19 @@ type RunContext struct {
 	Metadata    map[string]any
 }
 
-type ctxKey string
+type ctxKey struct{}
 
-const runCtxKey ctxKey = "run_context"
-
-func WithRunContext(parent any, ctx *RunContext) any {
-	// Placeholder — in real usage this wraps context.Context
-	return ctx
+func WithRunContext(parent context.Context, runContext *RunContext) context.Context {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithValue(parent, ctxKey{}, runContext)
 }
 
-func GetRunContext(ctx any) *RunContext {
-	if rc, ok := ctx.(*RunContext); ok {
-		return rc
+func RunContextFrom(ctx context.Context) (*RunContext, bool) {
+	if ctx == nil {
+		return nil, false
 	}
-	return nil
+	runContext, ok := ctx.Value(ctxKey{}).(*RunContext)
+	return runContext, ok && runContext != nil
 }
