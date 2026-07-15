@@ -27,15 +27,17 @@
 │  (Engine) │  (Tool)   │ (Memory)  │  (Model)  │  (Orch.)     │
 │           │           │           │           │              │
 │  Agent    │  Registry │  Buffer   │  OpenAI   │  Team        │
-│  Run Loop │  Execute  │  Summary  │  Anthropic│  Workflow    │
+│  Run Loop │  Execute  │ (Summary*)│  Anthropic│  Workflow    │
 ├──────────┴───────────┴───────────┴───────────┴───────────────┤
 │                        安全体系 (Security)                     │
 │  权限管理  |  Prompt 注入检测  |  PII 脱敏  |  路径校验         │
 ├──────────────────────────────────────────────────────────────┤
-│                        可观测性 (Observability)                │
-│  结构化日志 (slog)  |  错误码  |  Metrics                      │
+│                           运行诊断                              │
+│               结构化日志 (slog)  |  错误码  |  RunID           │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+`Summary*` 表示扩展点：当前 Harness 只创建 `BufferMemory`。slog、错误码与 RunID 用于排查库的运行问题；分析与报告系统不属于 Harness 的包边界。
 
 ```mermaid
 graph TB
@@ -64,15 +66,16 @@ graph TB
         PII["PII 脱敏"]
     end
     
-    subgraph OBS["可观测性"]
+    subgraph OBS["运行诊断"]
         LOG["slog 日志"]
-        MET["Metrics"]
+        ERR["结构化错误 + RunID"]
     end
     
     APP --> FACADE
     FACADE --> SEC
     SEC --> CORE
     CORE --> OBS
+    LOG --> ERR
     
     style APP fill:#f9f,stroke:#333
     style FACADE fill:#bbf,stroke:#333
@@ -212,6 +215,8 @@ type Harness struct {
 	agents            map[string]*engine.Agent
 	teams             map[string]*workflow.Team
 	workflows         map[string]*workflow.Workflow
+	baseLogger        *slog.Logger
+	logger            *slog.Logger
 	mu                 sync.RWMutex
 }
 ```
@@ -228,33 +233,33 @@ type Harness struct {
 
 ```go
 func (h *Harness) RunAgent(ctx context.Context, name, input string, opts ...engine.RunOption) *engine.RunOutput {
-	// 步骤 1：输入脱敏（去除手机号、身份证等敏感信息）
-	sanitizedInput := h.Sanitize(input)
-
-	// 步骤 2：输入校验（长度、注入检测）
-	if err := h.ValidateInput(sanitizedInput); err != nil {
-		return &engine.RunOutput{
-			Success: false,
-			Error:   err.Error(),
-		}
-	}
-
-	// 步骤 3：查找 Agent
+	// 步骤 1：先查找 Agent；不存在时不再处理输入
 	runtimeAgent, ok := h.Agent(name)
 	if !ok {
-		return &engine.RunOutput{
-			Success: false,
-			Error:   fmt.Sprintf("agent %q not found", name),
-		}
+		err := types.NewError(types.ErrInvalidConfig, fmt.Sprintf("agent %q not found", name))
+		return &engine.RunOutput{Success: false, Error: err.Error(), Err: err}
+	}
+
+	// 步骤 2：按配置脱敏输入（关闭 SanitizePII 时原样返回）
+	sanitizedInput := h.Sanitize(input)
+
+	// 步骤 3：输入校验（长度、危险内容、可选注入检测）
+	if err := h.ValidateInput(sanitizedInput); err != nil {
+		runErr := types.WrapError(types.ErrInvalidInput, "input validation failed", err)
+		return &engine.RunOutput{Success: false, Error: runErr.Error(), Err: runErr}
 	}
 
 	// 步骤 4：执行 Agent
 	output := runtimeAgent.Run(ctx, sanitizedInput, opts...)
 
-	// 步骤 5：输出脱敏
+	// 步骤 5：输出校验与脱敏；失败时保留已有运行证据
 	if output.Success {
 		if err := h.ValidateOutput(output.Content); err != nil {
-			return &engine.RunOutput{Success: false, Error: err.Error()}
+			runErr := types.WrapError(types.ErrInvalidInput, "output validation failed", err)
+			output.Success = false
+			output.Error = runErr.Error()
+			output.Err = runErr
+			return output
 		}
 		output.Content = h.Sanitize(output.Content)
 	}
@@ -267,32 +272,41 @@ func (h *Harness) RunAgent(ctx context.Context, name, input string, opts ...engi
 
 ```go
 func New(cfg Config, options ...Option) (*Harness, error) {
+	ResolveModelDefaults(&cfg.DefaultModel)
+	if cfg.MemoryConfig.Type == "" { cfg.MemoryConfig.Type = "buffer" }
+	if err := cfg.Validate(); err != nil { return nil, err }
+
+	// 教学简化：实际实现还会应用安全、logger 和 MCP Client Option，
+	// 并检查必需依赖非 nil。
+	baseLogger := newConfiguredLogger(cfg.LogLevel)
 	h := &Harness{
 		config:            cfg,
 		toolRegistry:      tool.NewRegistry(),
 		permissionManager: security.NewPermissionManager(),
-		inputValidator:    security.NewInputValidator(),
-		outputValidator:   security.NewOutputValidator(),
+		inputValidator: security.NewInputValidatorWithConfig(
+			cfg.Security.MaxInputLength,
+			cfg.Security.EnableInjectionCheck,
+		),
+		outputValidator: security.NewOutputValidatorWithMaxLength(cfg.Security.MaxOutputLength),
 		sanitizer:         security.NewSanitizer(),
 		mcpClients:        make(map[string]*mcp.Client),
 		agents:            make(map[string]*engine.Agent),
 		teams:             make(map[string]*workflow.Team),
 		workflows:         make(map[string]*workflow.Workflow),
+		baseLogger:        baseLogger,
+		logger:            baseLogger.With("component", "harness"),
 	}
 
-	// 设置日志级别
-	h.setupLogger(cfg.LogLevel)
-
-	// 构建模型
-	model, err := cfg.DefaultModel.BuildModel()
+	// 构建模型，并把同一个 logger 依赖传给 Provider。
+	model, err := cfg.DefaultModel.buildModel(baseLogger)
 	if err != nil {
 		return nil, fmt.Errorf("build model: %w", err)
 	}
 	h.model = model
 
-	// 设置权限模式
-	if cfg.PermissionMode == "strict" {
-		h.permissionManager.SetRole(security.RoleUser)
+	// permissive 为本地开发预授予内置权限；strict 保持默认拒绝。
+	if cfg.PermissionMode != "strict" {
+		h.permissionManager.SetRole(security.RoleAdmin)
 	}
 
 	// 注册内置工具
@@ -303,6 +317,10 @@ func New(cfg Config, options ...Option) (*Harness, error) {
 	return h, nil
 }
 ```
+
+上面的构造函数片段用于说明组装顺序，省略了 Memory 容量归一化、MCP Client 创建和依赖注入的完整错误处理。需要复制代码时应以 `harness.go` 为准。真实构造顺序是“归一化 → 校验 → 应用运行时依赖 → 构造组件 → 注册本地工具”。先校验可以避免服务启动后才发现拼错的 `api_format` 或重复的 MCP 名称。
+
+构造函数刻意不连接 MCP 网络；网络初始化由调用方显式调用 `InitMCPClients`。它也不会修改 `slog.Default`：公共库只管理自己的 logger，宿主应用可通过 `WithLogger` 注入统一日志出口。
 
 ---
 
@@ -347,7 +365,7 @@ func DefaultConfig() Config {
 }
 ```
 
-**为什么默认是 permissive？** 开发阶段过于严格的安全策略会影响迭代速度。生产环境中应改为 `"strict"`。
+**为什么默认是 permissive？** 开发阶段可以直接试用已注册的内置工具。生产环境应改为 `"strict"`，再通过 `AllowPermissions` 逐项开放。注意：`allowed_tools` 决定“是否注册”，权限配置决定“是否允许执行”，两者不是一回事。
 
 ### 2.4.3 从文件加载配置
 
@@ -377,11 +395,10 @@ func LoadConfig(path string) (Config, error) {
 
 ```text
 types ← model / memory
-model ← tool
-model + memory + tool ← engine
+model ← tool / mcp
+model + memory + tool + types ← engine
 engine + model ← workflow
-model ← mcp
-以上公开包 + mcp ← 根包 agent
+以上公开包 ← 根包 agent
 根包 agent + 公开扩展包 ← examples
 ```
 

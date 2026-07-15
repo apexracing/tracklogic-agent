@@ -1,5 +1,7 @@
 # 第 1 章 Harness 工程导论 + 项目脚手架
 
+> 阅读建议：先阅读 [学习路线与设计决策总览](00-learning-guide.md)。本章中的“代码中的体现”只描述当前仓库已经落地的能力；尚未接入运行时的生产能力会明确标成扩展设计。
+
 ## 1.1 为什么需要 Harness？
 
 ### 1.1.1 大模型的能力边界
@@ -12,11 +14,11 @@
 | 工具调用 | 无法直接操作外部系统 | 无法查数据库、发请求、读写文件 |
 | 可靠性保障 | 输出可能包含幻觉、格式错误 | 不可直接用于生产 |
 | 安全控制 | 可以被 Prompt 注入攻击 | 存在数据泄露风险 |
-| 可观测性 | 黑盒运行，无法追踪决策过程 | 问题排查困难 |
+| 可诊断性 | 黑盒运行，失败时缺少上下文 | 问题排查困难 |
 
 ### 1.1.2 Harness 的定位
 
-Harness 就是为了填补这些缺失能力而存在的工程系统。它像一个"缰绳系统"——骑手通过缰绳驾驭烈马，Harness 将大模型的推理能力转化为**可靠、可控、可观测**的生产级系统。
+Harness 就是为了填补这些缺失能力而存在的工程系统。它像一个"缰绳系统"——骑手通过缰绳驾驭烈马，Harness 将大模型的推理能力转化为**可靠、可控、可诊断**的生产级系统。
 
 用图表示 Harness 如何填补大模型的能力缺口：
 
@@ -32,7 +34,7 @@ graph LR
         B2["工具层"] --> A2
         B3["记忆子系统"] --> A3
         B4["安全体系"]
-        B5["可观测性"]
+        B5["日志与错误"]
         B6["编排引擎"]
     end
     LLM -- 缺失能力 --> Harness
@@ -49,7 +51,7 @@ graph LR
 | 缰绳（控制方向） | 运行时引擎（控制执行流） |
 | 马鞍（稳定支撑） | 工具层 + 记忆（提供执行基础） |
 | 马镫（安全保障） | 安全体系（约束边界） |
-| 马具（可观测） | 日志 + Metrics（可追踪） |
+| 马具（可诊断） | slog 运行日志、结构化错误和 RunID |
 
 这个比喻帮助理解 Harness 的核心定位：**不是替代大模型，而是驾驭它**。
 
@@ -65,7 +67,7 @@ graph LR
 
 **代码中的体现**：
 - 工具注册时明确声明参数 Schema
-- 权限系统默认拒绝所有操作，只开放明确允许的
+- 默认 PermissionManager 从空授权开始；Harness 的 `strict` 模式保留默认拒绝，`permissive` 仅用于开发便利
 - 文件操作限定在沙箱目录内
 
 ### 1.2.2 可验证性
@@ -75,9 +77,9 @@ graph LR
 **工程含义**：Agent 的每一步决策和执行结果都应有迹可循。包括模型返回的原始内容、工具调用的输入输出、Token 消耗量等。
 
 **代码中的体现**：
-- `RunOutput` 结构体携带完整执行记录
-- 日志记录每次模型调用和工具执行
-- Message 历史完整保留，可回溯整个推理过程
+- `RunOutput` 携带最终内容、消息快照、循环次数和 Token 汇总
+- slog 记录运行开始/结束、工具执行和失败信息
+- BufferMemory 保留容量范围内的消息，便于回看模型与工具的交互
 
 ### 1.2.3 渐进信任
 
@@ -87,7 +89,7 @@ graph LR
 
 **代码中的体现**：
 - PermissionManager 的 Role 机制（Guest→User→Admin）
-- 生产环境默认 "strict" 模式
+- 生产环境应配置为 `strict`；该模式启动时不预授予受控权限
 - 工具权限独立控制
 
 ### 1.2.4 故障假设
@@ -96,11 +98,12 @@ graph LR
 
 **工程含义**：网络可能断开、API 可能超时、模型可能返回乱码、工具可能崩溃。设计时假设所有外部依赖都不可靠。
 
-**代码中的体现**：
-- Context 超时控制贯穿所有外部调用
-- 指数退避重试机制
-- 断路器防止级联故障
-- 每个 error 都携带可识别的错误码
+**当前代码中的体现**：
+- `context.Context` 向模型、工具、Team 和 Workflow 传播取消信号
+- Model/MCP HTTP Client 有请求超时，Agent 有最大循环上限
+- 核心运行错误使用 `HarnessError` 错误码
+
+指数退避和断路器是第 11 章讨论的**扩展设计**，当前版本尚未接入运行时。把可靠性策略放在正确层级，比“遇到任何错误都重试”更重要。
 
 ### 1.2.5 智能体工学
 
@@ -161,8 +164,8 @@ graph TD
 │  └──────────────┘  └──────────────┘  └──────────────┘    │
 │                                                          │
 │  ┌──────────────────────────────────────────────────┐    │
-│  │           可观测性层 (Observability)               │    │
-│  │   slog 日志  |  结构化错误  |  Metrics             │    │
+│  │               运行诊断边界                         │    │
+│  │         slog 日志 | 结构化错误 | RunID             │    │
 │  └──────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -411,14 +414,14 @@ package types
 
 // RunContext 携带一次 Agent 运行的元信息
 type RunContext struct {
-	RunID       string         `json:"run_id"`
-	SessionID   string         `json:"session_id"`
-	UserID      string         `json:"user_id"`
-	AgentID     string         `json:"agent_id"`
-	TeamID      string         `json:"team_id,omitempty"`
-	WorkflowID  string         `json:"workflow_id,omitempty"`
-	ParentRunID string         `json:"parent_run_id,omitempty"`
-	Metadata    map[string]any `json:"metadata,omitempty"`
+	RunID       string
+	SessionID   string
+	UserID      string
+	AgentID     string
+	TeamID      string
+	WorkflowID  string
+	ParentRunID string
+	Metadata    map[string]any
 }
 
 func WithRunContext(parent context.Context, runContext *RunContext) context.Context {
@@ -431,7 +434,9 @@ func RunContextFrom(ctx context.Context) (*RunContext, bool) {
 }
 ```
 
-**设计意图**：`RunContext` 携带跨系统调用的追踪信息。当 Agent 被 Team 或 Workflow 调用时，父级 ID 会被传播到子 Agent 的执行链路中，形成完整的调用链，便于调试和监控。
+**设计意图与当前边界**：`RunContext` 是跨系统关联的稳定载体，`WithRunContext` 和 `RunContextFrom` 负责安全地存取它。直接调用 `Agent.Run` 时，如果 Context 中没有 `RunID`，Engine 会自动生成，并同时填入当前 `AgentID`；最终值可从 `RunOutput.RunID` 读取。调用方预先写入的 `SessionID`、`UserID`、`TeamID` 和 `WorkflowID` 会被保留并继续向 Model 与 Tool 传播。
+
+需要注意，自动化目前只发生在 Agent 边界：Team 和 Workflow 会继续传播 Context，但不会自动建立父子 `ParentRunID`，也不会为每个编排节点创建独立子 Run。完整的分布式父子调用链仍需应用层或后续扩展补齐。
 
 ---
 
@@ -450,7 +455,7 @@ func RunContextFrom(ctx context.Context) (*RunContext, bool) {
 
 ## 1.7 本章小结
 
-- 理解了为什么需要 Harness 工程——填补大模型缺失的执行、记忆、安全、可观测能力
+- 理解了为什么需要 Harness 工程——填补大模型缺失的执行、记忆、安全和运行诊断能力
 - 深入学习了五大工程原则：约束优先、可验证性、渐进信任、故障假设、智能体工学
 - 创建了项目的完整目录结构
 - 定义了核心类型系统：消息模型、错误体系、运行上下文

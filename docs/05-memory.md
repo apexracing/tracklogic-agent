@@ -16,9 +16,9 @@ graph TD
     D --> E["追加新消息<br/>[M4, M5, M6, M7, M8]"]
 ```
 
-**为什么丢弃最早而非最旧？**
+**为什么丢弃旧消息而不是最新消息？**
 - 在验证循环中，最新的消息（工具结果、模型回复）比最早的对话更有价值
-- System Prompt 每次 Run 时由 Agent 重新注入，不会被裁剪
+- AgentConfig 的 System Prompt 每次 Run 时由 Agent 重新注入；显式写入 Memory 开头的连续 System 消息也会被裁剪逻辑保留
 - 用户最近的需求比开场白更重要
 
 记忆是 Agent 的"短期工作记忆"。没有记忆，Agent 每次对话都是一次"失忆症"发作。
@@ -29,10 +29,7 @@ graph TD
 
 ### 5.1.1 大模型的上下文窗口限制
 
-所有大模型都有上下文窗口限制（Context Window）：
-- GPT-4o-mini: 128K tokens
-- Claude Sonnet: 200K tokens
-- Claude 3.5 Sonnet: 200K tokens
+所有大模型都有上下文窗口限制（Context Window），具体上限随模型版本变化，应以所接 Provider 的模型文档和响应错误为准。工程上不能因为某个模型窗口较大，就取消 Memory 预算。
 
 虽然这些窗口看起来很大，但每次 Agent 循环都会新增消息——用户输入、模型回复、工具调用、工具结果。多轮交互后上下文很容易耗尽。
 
@@ -110,19 +107,31 @@ func NewBufferMemory(capacity int) *BufferMemory {
 
 **为什么 capacity 默认 100？**
 
-100 条消息的经验估算：
-- 一个典型的 Agent 交互约 3-5 条消息/循环
-- `MaxLoops` 默认 10 → 约 30-50 条消息/次运行
-- 100 条可容纳 2-3 次完整的验证循环
+这里的 100 是直接调用 `memory.NewBufferMemory(0)` 时的兜底值。通过 `agent.DefaultConfig()` / `Harness.CreateAgent` 创建时，配置默认容量是 50；两条构造路径不要混为一谈。
+
+容量按“消息条数”而不是 Token 计算。一轮没有工具调用时通常增加 user + assistant；有工具调用时，每个 ToolCall 还会增加一条 tool 消息，而且一次模型响应可以包含多个 ToolCall。因此不能从 `MaxLoops=10` 推导固定消息数量。50/100 只是保守起点，生产应用应根据实际消息大小、工具并行度和模型上下文预算选择容量。
 
 ### 5.3.1 Add 方法——裁剪策略的核心
 
 ```go
 func (m *BufferMemory) Add(msg types.Message) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if len(m.messages) >= m.capacity {
-		// 超过容量时，丢弃前半部分
-		keep := m.messages[m.capacity/2:]
-		m.messages = keep
+		cut := m.capacity / 2
+		if cut < 1 { cut = 1 }
+
+		// 保留开头连续的 System 消息，再丢弃旧的非 System 消息。
+		start := 0
+		for start < len(m.messages) && m.messages[start].Role == types.RoleSystem {
+			start++
+		}
+		if start < cut {
+			m.messages = append(m.messages[:start], m.messages[cut:]...)
+		} else {
+			m.messages = m.messages[cut:]
+		}
 	}
 	m.messages = append(m.messages, msg)
 }
@@ -138,7 +147,8 @@ func (m *BufferMemory) Add(msg types.Message) {
 
 **决策依据**：
 - 验证循环中，最新的消息是工具调用结果和模型回复，比最早的对话更有价值
-- 系统提示词（System Prompt）不在 Memory 中——它在每次 Run 时由 Agent 重新注入
+- AgentConfig 中的 SystemPrompt 通常不写入 Memory，而是在 `buildMessages` 时注入
+- 调用 `AddSystemMessage` 可以显式写入 System 消息，因此裁剪算法会保留开头连续的 System 消息
 
 ### 5.3.2 Recent 方法
 
@@ -170,7 +180,7 @@ func (m *BufferMemory) Snapshot() []types.Message {
 }
 ```
 
-深度复制，确保外部修改不影响内部状态。
+这里是 **slice 的浅拷贝**：外部增删或替换 `Message` 元素不会改变 Memory 中的 slice；但 `Message.ToolCalls` 等元素内部的引用字段并未递归深拷贝。当前运行时把消息当作值读取，已经满足封装需要；如果未来允许调用方修改嵌套字段，应增加真正的深拷贝。
 
 ---
 
@@ -222,6 +232,7 @@ stateDiagram-v2
 ## 5.5 在 Agent 中使用 Memory
 
 ```go
+// 结构示意：真实字段是私有的，并带有 RWMutex 保护。
 func (a *Agent) Run(ctx context.Context, input string) *RunOutput {
 	// 用户消息入记忆
 	a.Memory.Add(types.Message{
@@ -246,13 +257,15 @@ func (a *Agent) Run(ctx context.Context, input string) *RunOutput {
 **Agent 和 Memory 的关系**：
 - Agent 持有 Memory 的引用（结构体字段）
 - 同一个 Memory 实例可以被多次 Run 调用共享
-- 如果需要"新对话"，可以调用 `Memory.Clear()` 或创建新的 Memory
+- `engine.Agent` 没有公开 `ClearMemory` 方法；自定义组装 Agent 时可保留 Memory 引用并调用 `Clear()`，使用 `Harness.CreateAgent` 时通常为新会话创建新的 Agent
+- 同一个 Agent 的 `Run` 由内部运行闸门串行化：第二个调用会等待前一个调用结束，等待期间仍能被 Context 取消
+- 串行化只解决“消息交错”和数据竞态，不解决会话隔离；两个用户复用同一个 Agent，仍会依次看到同一份历史
 
 ---
 
 ## 5.6 扩展：多会话支持
 
-生产环境中，不同用户应该有不同的 Memory。可以通过 `map[string]Memory` 实现：
+生产环境中，不同会话应该有不同的 Memory。可以通过 `map[string]Memory` 实现会话路由；下面是扩展设计，不是当前 Harness 内置 API：
 
 ```go
 type SessionManager struct {
@@ -272,6 +285,16 @@ func (sm *SessionManager) GetOrCreate(sessionID string) memory.Memory {
 }
 ```
 
+初学者容易把“并发安全”和“会话安全”当成同一件事。两者的区别是：
+
+| 问题 | 当前 Agent 的保证 | 应用层还要做什么 |
+|---|---|---|
+| 两个 goroutine 同时调用同一 Agent 会不会破坏内部状态？ | 不会；Run 会串行，Memory 自身也有锁 | 为等待设置 Context 截止时间 |
+| 两个用户会不会读到对方的历史？ | 会，只要它们复用同一个 Agent/Memory | 按会话路由到不同 Agent 或不同 Memory |
+| 不同会话能否并行执行？ | 可以，前提是使用不同 Agent 实例 | 管理实例生命周期与容量 |
+
+设计思路是让库守住通用的并发正确性，把“什么叫一个会话、何时过期、存到哪里”留给应用决定。后者依赖具体产品，放进通用 Harness 反而会制造错误假设。
+
 ---
 
 ## 5.7 本章小结
@@ -280,11 +303,12 @@ func (sm *SessionManager) GetOrCreate(sessionID string) memory.Memory {
 - 实现了 BufferMemory，采用"保留后半"裁剪策略
 - 确保了 Memory 的封装性（Snapshot 返回副本）
 - 理解了消息在验证循环中的完整生命周期
+- 区分了数据结构并发安全、单 Agent 串行执行和多会话语义隔离
 
 ---
 
 ## 练习
 
-1. 为 BufferMemory 添加 `sync.RWMutex` 实现并发安全
+1. 为 BufferMemory 编写并发读写测试，使用 `go test -race ./...` 验证现有 `sync.RWMutex`
 2. 实现 `TTLMemory`：每条消息带有 TTL（Time To Live），过期后自动淘汰
 3. 实现 `SummaryMemory`：当消息超限时，自动调用 LLM 生成摘要，用摘要替换旧消息

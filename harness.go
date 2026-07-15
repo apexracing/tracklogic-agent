@@ -2,9 +2,13 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"reflect"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +19,7 @@ import (
 	"github.com/apexracing/tracklogic-agent/security"
 	"github.com/apexracing/tracklogic-agent/tool"
 	"github.com/apexracing/tracklogic-agent/tool/builtin"
+	"github.com/apexracing/tracklogic-agent/types"
 	"github.com/apexracing/tracklogic-agent/workflow"
 )
 
@@ -32,10 +37,19 @@ type Harness struct {
 	agents            map[string]*engine.Agent
 	teams             map[string]*workflow.Team
 	workflows         map[string]*workflow.Workflow
+	baseLogger        *slog.Logger
 	logger            *slog.Logger
 }
 
 func New(cfg Config, options ...Option) (*Harness, error) {
+	cfg = cloneConfig(cfg)
+	ResolveModelDefaults(&cfg.DefaultModel)
+	if cfg.MemoryConfig.Type == "" {
+		cfg.MemoryConfig.Type = "buffer"
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	deps := harnessOptions{
 		permissionManager: security.NewPermissionManager(),
 		inputValidator: security.NewInputValidatorWithConfig(
@@ -50,10 +64,18 @@ func New(cfg Config, options ...Option) (*Harness, error) {
 			option(&deps)
 		}
 	}
-	if deps.permissionManager == nil || deps.inputValidator == nil || deps.outputValidator == nil || deps.sanitizer == nil {
+	if isNilDependency(deps.permissionManager) || isNilDependency(deps.inputValidator) ||
+		isNilDependency(deps.outputValidator) || isNilDependency(deps.sanitizer) {
 		return nil, fmt.Errorf("security dependencies must not be nil")
 	}
+	if deps.model != nil && isNilDependency(deps.model) {
+		return nil, fmt.Errorf("injected model must not be nil")
+	}
 
+	baseLogger := deps.logger
+	if baseLogger == nil {
+		baseLogger = newConfiguredLogger(cfg.LogLevel)
+	}
 	h := &Harness{
 		config:            cfg,
 		toolRegistry:      tool.NewRegistry(),
@@ -65,14 +87,17 @@ func New(cfg Config, options ...Option) (*Harness, error) {
 		agents:            make(map[string]*engine.Agent),
 		teams:             make(map[string]*workflow.Team),
 		workflows:         make(map[string]*workflow.Workflow),
-		logger:            slog.With("component", "harness"),
+		baseLogger:        baseLogger,
+		logger:            baseLogger.With("component", "harness"),
 	}
 
-	h.setupLogger(cfg.LogLevel)
-
-	runtimeModel, err := cfg.DefaultModel.BuildModel()
-	if err != nil {
-		return nil, fmt.Errorf("build model: %w", err)
+	runtimeModel := deps.model
+	if runtimeModel == nil {
+		var err error
+		runtimeModel, err = cfg.DefaultModel.buildModel(baseLogger)
+		if err != nil {
+			return nil, fmt.Errorf("build model: %w", err)
+		}
 	}
 	h.model = runtimeModel
 
@@ -82,8 +107,11 @@ func New(cfg Config, options ...Option) (*Harness, error) {
 	}
 	h.memoryCapacity = capacity
 
-	if cfg.PermissionMode == "strict" {
-		h.permissionManager.SetRole(security.RoleUser)
+	// Strict mode starts with no grants; callers must opt in with
+	// AllowPermissions. Permissive mode grants the built-in permission set so
+	// local examples can use configured tools without a second policy step.
+	if cfg.PermissionMode != "strict" {
+		h.permissionManager.SetRole(security.RoleAdmin)
 	}
 
 	for _, mcpConfig := range cfg.MCPClients {
@@ -91,7 +119,22 @@ func New(cfg Config, options ...Option) (*Harness, error) {
 		if timeout <= 0 {
 			timeout = 30 * time.Second
 		}
-		h.mcpClients[mcpConfig.Name] = mcp.NewClient(mcpConfig.BaseURL, timeout)
+		clientOptions := []mcp.ClientOption{
+			mcp.WithLogger(h.baseLogger),
+		}
+		if mcpConfig.ProtocolVersion != "" {
+			clientOptions = append(clientOptions, mcp.WithProtocolVersion(mcpConfig.ProtocolVersion))
+		}
+		h.mcpClients[mcpConfig.Name] = mcp.NewClient(mcpConfig.BaseURL, timeout, clientOptions...)
+	}
+	for name, client := range deps.mcpClients {
+		if err := validateMCPClientName(name); err != nil {
+			return nil, fmt.Errorf("invalid injected MCP client name: %w", err)
+		}
+		if client == nil {
+			return nil, fmt.Errorf("injected MCP client %q is nil", name)
+		}
+		h.mcpClients[name] = client
 	}
 
 	for _, toolName := range cfg.AllowedTools {
@@ -101,10 +144,29 @@ func New(cfg Config, options ...Option) (*Harness, error) {
 	return h, nil
 }
 
+func isNilDependency(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
+}
+
 func (h *Harness) Config() Config {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return h.config
+	return cloneConfig(h.config)
+}
+
+func cloneConfig(cfg Config) Config {
+	cfg.AllowedTools = append([]string(nil), cfg.AllowedTools...)
+	cfg.MCPClients = append([]MCPClientConfig(nil), cfg.MCPClients...)
+	return cfg
 }
 
 func (h *Harness) Model() model.Model {
@@ -115,7 +177,7 @@ func (h *Harness) Model() model.Model {
 
 func (h *Harness) ToolRegistry() *tool.Registry { return h.toolRegistry }
 
-func (h *Harness) setupLogger(level string) {
+func newConfiguredLogger(level string) *slog.Logger {
 	var configuredLevel slog.Level
 	switch level {
 	case "debug":
@@ -127,7 +189,7 @@ func (h *Harness) setupLogger(level string) {
 	default:
 		configuredLevel = slog.LevelInfo
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: configuredLevel})))
+	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: configuredLevel}))
 }
 
 func (h *Harness) registerBuiltinTool(name string) {
@@ -160,24 +222,77 @@ func (h *Harness) RegisterTool(runtimeTool tool.Tool) error {
 	return h.toolRegistry.Register(runtimeTool)
 }
 
+// NewAgent is the compatibility convenience constructor. It returns nil and
+// logs when validation or registration fails. Production code should prefer
+// CreateAgent and handle its error.
 func (h *Harness) NewAgent(name, systemPrompt string) *engine.Agent {
+	runtimeAgent, err := h.CreateAgent(name, systemPrompt)
+	if err != nil {
+		h.logger.Error("failed to create agent", "name", name, "error", err)
+		return nil
+	}
+	return runtimeAgent
+}
+
+// CreateAgent constructs and atomically registers an Agent. Production code
+// should prefer this method over NewAgent so invalid or duplicate names cannot
+// fail silently.
+func (h *Harness) CreateAgent(name, systemPrompt string) (*engine.Agent, error) {
+	return h.createAgent(name, systemPrompt, false, nil)
+}
+
+// CreateAgentWithTools constructs and atomically registers an Agent whose
+// visible and executable Tool set is restricted to the supplied names. An
+// empty list creates an Agent with no tools.
+func (h *Harness) CreateAgentWithTools(name, systemPrompt string, toolNames ...string) (*engine.Agent, error) {
+	return h.createAgent(name, systemPrompt, true, toolNames)
+}
+
+func (h *Harness) createAgent(name, systemPrompt string, restrictTools bool, toolNames []string) (*engine.Agent, error) {
+	if name == "" || name != strings.TrimSpace(name) {
+		return nil, fmt.Errorf("agent name must be non-empty and must not have surrounding whitespace")
+	}
+	if restrictTools {
+		seen := make(map[string]struct{}, len(toolNames))
+		for _, toolName := range toolNames {
+			if toolName == "" || toolName != strings.TrimSpace(toolName) {
+				return nil, fmt.Errorf("agent tool name must be non-empty and must not have surrounding whitespace")
+			}
+			if _, duplicate := seen[toolName]; duplicate {
+				return nil, fmt.Errorf("agent %q has duplicate tool %q", name, toolName)
+			}
+			if _, exists := h.toolRegistry.Get(toolName); !exists {
+				return nil, fmt.Errorf("agent %q tool %q is not registered", name, toolName)
+			}
+			seen[toolName] = struct{}{}
+		}
+	}
 	runtimeAgent := engine.NewAgent(engine.AgentConfig{
 		Name:                name,
 		SystemPrompt:        systemPrompt,
 		Model:               h.Model(),
 		ToolRegistry:        h.toolRegistry,
+		RestrictTools:       restrictTools,
+		AllowedTools:        append([]string(nil), toolNames...),
 		Memory:              memory.NewBufferMemory(h.memoryCapacity),
 		CheckToolPermission: h.checkToolPermission,
+		Logger:              h.baseLogger,
 	})
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, exists := h.agents[name]; exists {
+		return nil, fmt.Errorf("agent %q already registered", name)
+	}
 	h.agents[name] = runtimeAgent
-	h.mu.Unlock()
-	return runtimeAgent
+	return runtimeAgent, nil
 }
 
 func (h *Harness) RegisterAgent(runtimeAgent *engine.Agent) error {
-	if runtimeAgent == nil || runtimeAgent.Name() == "" {
+	if runtimeAgent == nil || runtimeAgent.Name() == "" || runtimeAgent.Name() != strings.TrimSpace(runtimeAgent.Name()) {
 		return fmt.Errorf("agent and agent name are required")
+	}
+	if isNilDependency(runtimeAgent.Model()) {
+		return fmt.Errorf("agent %q model is required", runtimeAgent.Name())
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -204,17 +319,38 @@ func (h *Harness) checkToolPermission(toolName string) error {
 	return h.permissionManager.Check(permission)
 }
 
+// NewTeam is the compatibility convenience constructor. Production code
+// should prefer CreateTeam and handle its error.
 func (h *Harness) NewTeam(cfg workflow.TeamConfig) *workflow.Team {
-	team := workflow.NewTeam(cfg)
-	h.mu.Lock()
-	h.teams[cfg.Name] = team
-	h.mu.Unlock()
+	team, err := h.CreateTeam(cfg)
+	if err != nil {
+		h.logger.Error("failed to create team", "name", cfg.Name, "error", err)
+		return nil
+	}
 	return team
 }
 
+// CreateTeam validates, constructs, and atomically registers a Team.
+func (h *Harness) CreateTeam(cfg workflow.TeamConfig) (*workflow.Team, error) {
+	if cfg.Logger == nil {
+		cfg.Logger = h.baseLogger
+	}
+	team := workflow.NewTeam(cfg)
+	if err := team.Validate(); err != nil {
+		return nil, err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, exists := h.teams[cfg.Name]; exists {
+		return nil, fmt.Errorf("team %q already registered", cfg.Name)
+	}
+	h.teams[cfg.Name] = team
+	return team, nil
+}
+
 func (h *Harness) RegisterTeam(team *workflow.Team) error {
-	if team == nil || team.Name == "" {
-		return fmt.Errorf("team and team name are required")
+	if err := team.Validate(); err != nil {
+		return err
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -232,17 +368,38 @@ func (h *Harness) Team(name string) (*workflow.Team, bool) {
 	return team, ok
 }
 
+// NewWorkflow is the compatibility convenience constructor. Production code
+// should prefer CreateWorkflow and handle its error.
 func (h *Harness) NewWorkflow(cfg workflow.WorkflowConfig) *workflow.Workflow {
-	runtimeWorkflow := workflow.NewWorkflow(cfg)
-	h.mu.Lock()
-	h.workflows[cfg.Name] = runtimeWorkflow
-	h.mu.Unlock()
+	runtimeWorkflow, err := h.CreateWorkflow(cfg)
+	if err != nil {
+		h.logger.Error("failed to create workflow", "name", cfg.Name, "error", err)
+		return nil
+	}
 	return runtimeWorkflow
 }
 
+// CreateWorkflow validates, constructs, and atomically registers a Workflow.
+func (h *Harness) CreateWorkflow(cfg workflow.WorkflowConfig) (*workflow.Workflow, error) {
+	if cfg.Logger == nil {
+		cfg.Logger = h.baseLogger
+	}
+	runtimeWorkflow := workflow.NewWorkflow(cfg)
+	if err := runtimeWorkflow.Validate(); err != nil {
+		return nil, err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, exists := h.workflows[cfg.Name]; exists {
+		return nil, fmt.Errorf("workflow %q already registered", cfg.Name)
+	}
+	h.workflows[cfg.Name] = runtimeWorkflow
+	return runtimeWorkflow, nil
+}
+
 func (h *Harness) RegisterWorkflow(runtimeWorkflow *workflow.Workflow) error {
-	if runtimeWorkflow == nil || runtimeWorkflow.Name == "" {
-		return fmt.Errorf("workflow and workflow name are required")
+	if err := runtimeWorkflow.Validate(); err != nil {
+		return err
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -284,7 +441,16 @@ func (h *Harness) CheckPermission(permission security.Permission) error {
 }
 
 func (h *Harness) InitMCPClients(ctx context.Context) error {
-	for name, client := range h.mcpClients {
+	names := make([]string, 0, len(h.mcpClients))
+	for name := range h.mcpClients {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	pending := make([]tool.Tool, 0)
+	pendingNames := make(map[string]struct{})
+	for _, name := range names {
+		client := h.mcpClients[name]
 		if err := client.Initialize(ctx); err != nil {
 			return fmt.Errorf("initialize MCP client %q: %w", name, err)
 		}
@@ -294,10 +460,27 @@ func (h *Harness) InitMCPClients(ctx context.Context) error {
 		}
 		for _, definition := range definitions {
 			adapter := &mcpToolAdapter{clientName: name, client: client, definition: definition}
-			if err := h.RegisterTool(adapter); err != nil {
-				h.logger.Warn("failed to register MCP tool", "name", adapter.Name(), "error", err)
+			adapterName := adapter.Name()
+			if _, exists := h.toolRegistry.Get(adapterName); exists {
+				return fmt.Errorf("register MCP tool: tool %q already exists", adapterName)
 			}
+			if _, duplicate := pendingNames[adapterName]; duplicate {
+				return fmt.Errorf("register MCP tool: duplicate discovered tool %q", adapterName)
+			}
+			pendingNames[adapterName] = struct{}{}
+			pending = append(pending, adapter)
 		}
+	}
+
+	registered := make([]string, 0, len(pending))
+	for _, runtimeTool := range pending {
+		if err := h.RegisterTool(runtimeTool); err != nil {
+			for _, name := range registered {
+				h.toolRegistry.Unregister(name)
+			}
+			return fmt.Errorf("register MCP tool %q: %w", runtimeTool.Name(), err)
+		}
+		registered = append(registered, runtimeTool.Name())
 	}
 	return nil
 }
@@ -305,16 +488,22 @@ func (h *Harness) InitMCPClients(ctx context.Context) error {
 func (h *Harness) RunAgent(ctx context.Context, name, input string, options ...engine.RunOption) *engine.RunOutput {
 	runtimeAgent, ok := h.Agent(name)
 	if !ok {
-		return &engine.RunOutput{Success: false, Error: fmt.Sprintf("agent %q not found", name)}
+		err := types.NewError(types.ErrInvalidConfig, fmt.Sprintf("agent %q not found", name))
+		return &engine.RunOutput{Success: false, Error: err.Error(), Err: err}
 	}
 	validatedInput := h.Sanitize(input)
 	if err := h.ValidateInput(validatedInput); err != nil {
-		return &engine.RunOutput{Success: false, Error: err.Error()}
+		runErr := types.WrapError(types.ErrInvalidInput, "input validation failed", err)
+		return &engine.RunOutput{Success: false, Error: runErr.Error(), Err: runErr}
 	}
 	output := runtimeAgent.Run(ctx, validatedInput, options...)
 	if output.Success {
 		if err := h.ValidateOutput(output.Content); err != nil {
-			return &engine.RunOutput{Success: false, Error: err.Error(), LoopCount: output.LoopCount}
+			runErr := types.WrapError(types.ErrInvalidInput, "output validation failed", err)
+			output.Success = false
+			output.Error = runErr.Error()
+			output.Err = runErr
+			return output
 		}
 		output.Content = h.Sanitize(output.Content)
 	}
@@ -324,16 +513,22 @@ func (h *Harness) RunAgent(ctx context.Context, name, input string, options ...e
 func (h *Harness) RunTeam(ctx context.Context, name, input string) *workflow.TeamOutput {
 	team, ok := h.Team(name)
 	if !ok {
-		return &workflow.TeamOutput{Success: false, Error: fmt.Sprintf("team %q not found", name)}
+		err := types.NewError(types.ErrInvalidConfig, fmt.Sprintf("team %q not found", name))
+		return &workflow.TeamOutput{Success: false, Error: err.Error(), Err: err}
 	}
 	validatedInput := h.Sanitize(input)
 	if err := h.ValidateInput(validatedInput); err != nil {
-		return &workflow.TeamOutput{Success: false, Error: err.Error()}
+		runErr := types.WrapError(types.ErrInvalidInput, "input validation failed", err)
+		return &workflow.TeamOutput{Success: false, Error: runErr.Error(), Err: runErr}
 	}
 	output := team.Run(ctx, validatedInput)
 	if output.Success {
 		if err := h.ValidateOutput(output.FinalOutput); err != nil {
-			return &workflow.TeamOutput{Success: false, Error: err.Error(), AgentOutputs: output.AgentOutputs}
+			runErr := types.WrapError(types.ErrInvalidInput, "output validation failed", err)
+			output.Success = false
+			output.Error = runErr.Error()
+			output.Err = runErr
+			return output
 		}
 		output.FinalOutput = h.Sanitize(output.FinalOutput)
 	}
@@ -343,23 +538,45 @@ func (h *Harness) RunTeam(ctx context.Context, name, input string) *workflow.Tea
 func (h *Harness) RunWorkflow(ctx context.Context, name, input string) *workflow.WorkflowResult {
 	runtimeWorkflow, ok := h.Workflow(name)
 	if !ok {
-		return &workflow.WorkflowResult{Success: false, Error: fmt.Sprintf("workflow %q not found", name)}
+		err := types.NewError(types.ErrInvalidConfig, fmt.Sprintf("workflow %q not found", name))
+		return &workflow.WorkflowResult{Success: false, Error: err.Error(), Err: err}
 	}
 	validatedInput := h.Sanitize(input)
 	if err := h.ValidateInput(validatedInput); err != nil {
-		return &workflow.WorkflowResult{Success: false, Error: err.Error()}
+		runErr := types.WrapError(types.ErrInvalidInput, "input validation failed", err)
+		return &workflow.WorkflowResult{Success: false, Error: runErr.Error(), Err: runErr}
 	}
 	result := runtimeWorkflow.Run(ctx, validatedInput)
 	if result.Success {
 		if err := h.ValidateOutput(result.Output); err != nil {
-			return &workflow.WorkflowResult{Success: false, Error: err.Error(), State: result.State, StepLogs: result.StepLogs}
+			runErr := types.WrapError(types.ErrInvalidInput, "output validation failed", err)
+			result.Success = false
+			result.Error = runErr.Error()
+			result.Err = runErr
+			return result
 		}
 		result.Output = h.Sanitize(result.Output)
 	}
 	return result
 }
 
-func (h *Harness) Close() error { return nil }
+func (h *Harness) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	names := make([]string, 0, len(h.mcpClients))
+	for name := range h.mcpClients {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	closeErrors := make([]error, 0)
+	for _, name := range names {
+		if err := h.mcpClients[name].Close(ctx); err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("close MCP client %q: %w", name, err))
+		}
+	}
+	return errors.Join(closeErrors...)
+}
 
 type mcpToolAdapter struct {
 	clientName string
@@ -387,5 +604,21 @@ func (adapter *mcpToolAdapter) Definition() model.ToolDefinition {
 func (*mcpToolAdapter) Validate(map[string]any) error { return nil }
 
 func (adapter *mcpToolAdapter) Execute(ctx context.Context, arguments map[string]any) (any, error) {
-	return adapter.client.CallTool(ctx, adapter.definition.Name, arguments)
+	result, err := adapter.client.CallToolResult(ctx, adapter.definition.Name, arguments)
+	if err != nil {
+		return nil, err
+	}
+	if result.StructuredContent != nil {
+		return result.StructuredContent, nil
+	}
+	texts := make([]string, 0, len(result.Content))
+	for _, content := range result.Content {
+		if content.Type == "text" {
+			texts = append(texts, content.Text)
+		}
+	}
+	if len(texts) > 0 {
+		return strings.Join(texts, "\n"), nil
+	}
+	return result.Content, nil
 }

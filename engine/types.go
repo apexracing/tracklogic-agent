@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"log/slog"
+
 	"github.com/apexracing/tracklogic-agent/memory"
 	"github.com/apexracing/tracklogic-agent/model"
 	"github.com/apexracing/tracklogic-agent/tool"
@@ -8,13 +10,17 @@ import (
 )
 
 type RunOutput struct {
-	Content     string           `json:"content"`
-	ToolCalls   []types.ToolCall `json:"tool_calls,omitempty"`
-	Messages    []types.Message  `json:"messages,omitempty"`
-	Success     bool             `json:"success"`
-	Error       string           `json:"error,omitempty"`
-	TotalTokens int              `json:"total_tokens"`
-	LoopCount   int              `json:"loop_count"`
+	RunID     string           `json:"run_id"`
+	Content   string           `json:"content"`
+	ToolCalls []types.ToolCall `json:"tool_calls,omitempty"`
+	Messages  []types.Message  `json:"messages,omitempty"`
+	Success   bool             `json:"success"`
+	Error     string           `json:"error,omitempty"`
+	// Err preserves the structured failure for errors.Is/errors.As. Error is
+	// retained as the serialized, backward-compatible representation.
+	Err         error `json:"-"`
+	TotalTokens int   `json:"total_tokens"`
+	LoopCount   int   `json:"loop_count"`
 }
 
 type RunOption func(*runConfig)
@@ -50,11 +56,16 @@ func WithModel(m model.Model) RunOption {
 }
 
 type AgentConfig struct {
-	Name                string
-	SystemPrompt        string
-	Model               model.Model
-	ToolRegistry        *tool.Registry
+	Name         string
+	SystemPrompt string
+	Model        model.Model
+	ToolRegistry *tool.Registry
+	// RestrictTools makes AllowedTools an exact per-Agent capability set. When
+	// false, the Agent can see every Tool in ToolRegistry for compatibility.
+	RestrictTools       bool
+	AllowedTools        []string
 	Memory              memory.Memory
 	MaxLoops            int
 	CheckToolPermission func(toolName string) error
+	Logger              *slog.Logger
 }

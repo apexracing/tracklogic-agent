@@ -4,11 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/apexracing/tracklogic-agent/mcp"
 	"github.com/apexracing/tracklogic-agent/model"
+	"github.com/apexracing/tracklogic-agent/types"
 )
 
 type Config struct {
@@ -36,14 +39,15 @@ type ModelConfig struct {
 }
 
 type MemoryConfig struct {
-	Type     string `json:"type"` // buffer, summary
+	Type     string `json:"type"` // buffer; reserved for future memory implementations
 	Capacity int    `json:"capacity"`
 }
 
 type MCPClientConfig struct {
-	Name    string `json:"name"`
-	BaseURL string `json:"base_url"`
-	Timeout int    `json:"timeout_seconds"`
+	Name            string `json:"name"`
+	BaseURL         string `json:"base_url"`
+	Timeout         int    `json:"timeout_seconds"`
+	ProtocolVersion string `json:"protocol_version,omitempty"`
 }
 
 type SecurityConfig struct {
@@ -97,19 +101,141 @@ func LoadConfig(path string) (Config, error) {
 }
 
 // ResolveModelDefaults normalizes vendor/api_format and timeout.
-// BaseURL is never inferred from vendor ? configure it explicitly (vendor and api_format are independent).
+// BaseURL is never inferred from vendor; configure it explicitly because
+// vendor and api_format are independent.
 func ResolveModelDefaults(cfg *ModelConfig) {
 	if cfg == nil {
 		return
 	}
 	cfg.Vendor = strings.ToLower(strings.TrimSpace(cfg.Vendor))
 	cfg.APIFormat = strings.ToLower(strings.TrimSpace(cfg.APIFormat))
-	if cfg.Timeout <= 0 {
+	if cfg.Timeout == 0 {
 		cfg.Timeout = 60
 	}
 }
 
+// Validate rejects ambiguous or unsupported production configuration before
+// the Harness starts accepting work.
+func (c Config) Validate() error {
+	if c.Name == "" || c.Name != strings.TrimSpace(c.Name) {
+		return types.NewError(types.ErrInvalidConfig, "config name must be non-empty and must not have surrounding whitespace")
+	}
+	switch c.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		return types.NewError(types.ErrInvalidConfig, fmt.Sprintf("unsupported log_level %q", c.LogLevel))
+	}
+	switch c.DefaultModel.APIFormat {
+	case "openai_response", "openai_chat_completions", "anthropic_message", "mock":
+	default:
+		return types.NewError(types.ErrInvalidConfig, fmt.Sprintf("unsupported api_format %q", c.DefaultModel.APIFormat))
+	}
+	if c.DefaultModel.ModelID == "" || c.DefaultModel.ModelID != strings.TrimSpace(c.DefaultModel.ModelID) {
+		return types.NewError(types.ErrInvalidConfig, "default_model.model_id must be non-empty and must not have surrounding whitespace")
+	}
+	if c.DefaultModel.Timeout < 0 {
+		return types.NewError(types.ErrInvalidConfig, "default_model.timeout_seconds must not be negative")
+	}
+	if c.DefaultModel.BaseURL != "" {
+		if err := validateHTTPURL(c.DefaultModel.BaseURL); err != nil {
+			return types.WrapError(types.ErrInvalidConfig, "invalid default_model.base_url", err)
+		}
+	}
+	if c.MemoryConfig.Type != "" && c.MemoryConfig.Type != "buffer" {
+		return types.NewError(types.ErrInvalidConfig, fmt.Sprintf("unsupported memory.type %q", c.MemoryConfig.Type))
+	}
+	if c.MemoryConfig.Capacity < 0 {
+		return types.NewError(types.ErrInvalidConfig, "memory.capacity must not be negative")
+	}
+	if c.PermissionMode != "strict" && c.PermissionMode != "permissive" {
+		return types.NewError(types.ErrInvalidConfig, fmt.Sprintf("unsupported permission_mode %q", c.PermissionMode))
+	}
+	if c.Security.MaxInputLength < 0 || c.Security.MaxOutputLength < 0 {
+		return types.NewError(types.ErrInvalidConfig, "security length limits must not be negative")
+	}
+
+	builtinNames := map[string]struct{}{
+		"calculator": {}, "read_file": {}, "write_file": {}, "get_current_time": {},
+		"list_dir": {}, "http_get": {}, "json_parse": {},
+	}
+	seenTools := make(map[string]struct{}, len(c.AllowedTools))
+	for _, name := range c.AllowedTools {
+		if _, ok := builtinNames[name]; !ok {
+			return types.NewError(types.ErrInvalidConfig, fmt.Sprintf("unknown allowed_tools entry %q", name))
+		}
+		if _, duplicate := seenTools[name]; duplicate {
+			return types.NewError(types.ErrInvalidConfig, fmt.Sprintf("duplicate allowed_tools entry %q", name))
+		}
+		seenTools[name] = struct{}{}
+	}
+
+	seenMCP := make(map[string]struct{}, len(c.MCPClients))
+	for _, client := range c.MCPClients {
+		if err := validateMCPClientName(client.Name); err != nil {
+			return types.WrapError(types.ErrInvalidConfig, "invalid mcp client name", err)
+		}
+		if _, duplicate := seenMCP[client.Name]; duplicate {
+			return types.NewError(types.ErrInvalidConfig, fmt.Sprintf("duplicate mcp client name %q", client.Name))
+		}
+		seenMCP[client.Name] = struct{}{}
+		if err := validateHTTPURL(client.BaseURL); err != nil {
+			return types.WrapError(types.ErrInvalidConfig, fmt.Sprintf("invalid mcp client %q base_url", client.Name), err)
+		}
+		if client.Timeout < 0 {
+			return types.NewError(types.ErrInvalidConfig, fmt.Sprintf("mcp client %q timeout_seconds must not be negative", client.Name))
+		}
+		if client.ProtocolVersion != "" && !mcp.IsSupportedProtocolVersion(client.ProtocolVersion) {
+			return types.NewError(types.ErrInvalidConfig, fmt.Sprintf("mcp client %q has unsupported protocol_version %q", client.Name, client.ProtocolVersion))
+		}
+	}
+	return nil
+}
+
+func validateMCPClientName(name string) error {
+	if name == "" {
+		return fmt.Errorf("name is required")
+	}
+	for _, char := range name {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '_' || char == '-' {
+			continue
+		}
+		return fmt.Errorf("name %q may contain only letters, digits, '_' and '-'", name)
+	}
+	return nil
+}
+
+func validateHTTPURL(value string) error {
+	parsed, err := url.ParseRequestURI(value)
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("URL scheme must be http or https")
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("URL host is required")
+	}
+	return nil
+}
+
 func (c ModelConfig) BuildModel() (model.Model, error) {
+	ResolveModelDefaults(&c)
+	if c.ModelID == "" || c.ModelID != strings.TrimSpace(c.ModelID) {
+		return nil, types.NewError(types.ErrInvalidConfig, "model_id must be non-empty and must not have surrounding whitespace")
+	}
+	if c.Timeout < 0 {
+		return nil, types.NewError(types.ErrInvalidConfig, "timeout_seconds must not be negative")
+	}
+	if c.BaseURL != "" {
+		if err := validateHTTPURL(c.BaseURL); err != nil {
+			return nil, types.WrapError(types.ErrInvalidConfig, "invalid base_url", err)
+		}
+	}
+	return c.buildModel(nil)
+}
+
+func (c ModelConfig) buildModel(logger *slog.Logger) (model.Model, error) {
 	timeout := time.Duration(c.Timeout) * time.Second
 	if timeout <= 0 {
 		timeout = 60 * time.Second
@@ -122,6 +248,7 @@ func (c ModelConfig) BuildModel() (model.Model, error) {
 			BaseURL: c.BaseURL,
 			ModelID: c.ModelID,
 			Timeout: timeout,
+			Logger:  logger,
 		}), nil
 	case "openai_chat_completions":
 		return model.NewOpenAIChat(model.OpenAIConfig{
@@ -129,6 +256,7 @@ func (c ModelConfig) BuildModel() (model.Model, error) {
 			BaseURL: c.BaseURL,
 			ModelID: c.ModelID,
 			Timeout: timeout,
+			Logger:  logger,
 		}), nil
 	case "anthropic_message":
 		return model.NewAnthropic(model.AnthropicConfig{
@@ -136,6 +264,7 @@ func (c ModelConfig) BuildModel() (model.Model, error) {
 			BaseURL: c.BaseURL,
 			ModelID: c.ModelID,
 			Timeout: timeout,
+			Logger:  logger,
 		}), nil
 	case "mock":
 		return model.NewMock(c.ModelID), nil

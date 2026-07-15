@@ -23,6 +23,7 @@ type OpenAIChatProvider struct {
 	baseURL    string
 	modelID    string
 	httpClient *http.Client
+	headers    http.Header
 	logger     *slog.Logger
 }
 
@@ -33,15 +34,20 @@ func NewOpenAIChat(cfg OpenAIConfig) *OpenAIChatProvider {
 	if cfg.ModelID == "" {
 		cfg.ModelID = "gpt-4o-mini"
 	}
-	if cfg.Timeout == 0 {
+	if cfg.Timeout <= 0 {
 		cfg.Timeout = 60 * time.Second
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
 	}
 	return &OpenAIChatProvider{
 		apiKey:     cfg.APIKey,
 		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
 		modelID:    cfg.ModelID,
-		httpClient: &http.Client{Timeout: cfg.Timeout},
-		logger:     slog.With("component", "model", "provider", "openai_chat_completions", "model_id", cfg.ModelID),
+		httpClient: configuredHTTPClient(cfg.HTTPClient, cfg.Timeout),
+		headers:    cfg.Headers.Clone(),
+		logger:     logger.With("component", "model", "provider", "openai_chat_completions", "model_id", cfg.ModelID),
 	}
 }
 
@@ -115,6 +121,9 @@ type chatStreamChunk struct {
 }
 
 func (p *OpenAIChatProvider) Invoke(ctx context.Context, req *InvokeRequest) (*InvokeResponse, error) {
+	if err := validateInvokeRequest(req); err != nil {
+		return nil, err
+	}
 	chatReq, err := p.buildRequest(req, false)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
@@ -133,23 +142,21 @@ func (p *OpenAIChatProvider) Invoke(ctx context.Context, req *InvokeRequest) (*I
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	applyCustomHeaders(httpReq, p.headers)
 
 	resp, err := p.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, types.WrapError(types.ErrAPIError, "http request failed", err)
+		return nil, modelTransportError(err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, types.WrapError(types.ErrAPIError,
-			fmt.Sprintf("API returned status %d", resp.StatusCode),
-			fmt.Errorf("%s", string(respBody)))
+		return nil, modelHTTPError(p.Provider(), resp)
 	}
 
 	var chatResp chatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+	if err := decodeModelJSON(resp.Body, &chatResp); err != nil {
+		return nil, err
 	}
 
 	if len(chatResp.Choices) == 0 {
@@ -185,6 +192,9 @@ func (p *OpenAIChatProvider) Invoke(ctx context.Context, req *InvokeRequest) (*I
 }
 
 func (p *OpenAIChatProvider) InvokeStream(ctx context.Context, req *InvokeRequest) (<-chan ResponseChunk, error) {
+	if err := validateInvokeRequest(req); err != nil {
+		return nil, err
+	}
 	chatReq, err := p.buildRequest(req, true)
 	if err != nil {
 		return nil, err
@@ -201,10 +211,11 @@ func (p *OpenAIChatProvider) InvokeStream(ctx context.Context, req *InvokeReques
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	applyCustomHeaders(httpReq, p.headers)
 
 	resp, err := p.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, err
+		return nil, modelTransportError(err)
 	}
 
 	ch := make(chan ResponseChunk, 64)
@@ -213,10 +224,7 @@ func (p *OpenAIChatProvider) InvokeStream(ctx context.Context, req *InvokeReques
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			respBody, _ := io.ReadAll(resp.Body)
-			ch <- ResponseChunk{Error: types.WrapError(types.ErrAPIError,
-				fmt.Sprintf("API returned status %d", resp.StatusCode),
-				fmt.Errorf("%s", string(respBody)))}
+			emitResponseChunk(ctx, ch, ResponseChunk{Error: modelHTTPError(p.Provider(), resp)})
 			return
 		}
 
@@ -230,13 +238,14 @@ func (p *OpenAIChatProvider) InvokeStream(ctx context.Context, req *InvokeReques
 			}
 			data := strings.TrimPrefix(line, "data: ")
 			if data == "[DONE]" {
-				ch <- ResponseChunk{Done: true}
+				emitResponseChunk(ctx, ch, ResponseChunk{Done: true})
 				return
 			}
 
 			var chunk chatStreamChunk
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-				continue
+				emitResponseChunk(ctx, ch, ResponseChunk{Error: modelStreamError("decode chat stream event", err)})
+				return
 			}
 			if len(chunk.Choices) == 0 {
 				continue
@@ -259,12 +268,19 @@ func (p *OpenAIChatProvider) InvokeStream(ctx context.Context, req *InvokeReques
 				rc.FinishReason = *chunk.Choices[0].FinishReason
 				rc.Done = true
 			}
-			ch <- rc
+			if !emitResponseChunk(ctx, ch, rc) {
+				return
+			}
+			if rc.Done {
+				return
+			}
 		}
 
 		if err := scanner.Err(); err != nil {
-			ch <- ResponseChunk{Error: err}
+			emitResponseChunk(ctx, ch, ResponseChunk{Error: modelStreamError("read chat stream", err)})
+			return
 		}
+		emitResponseChunk(ctx, ch, ResponseChunk{Error: modelStreamError("chat stream ended before completion", io.EOF)})
 	}()
 
 	return ch, nil
@@ -301,10 +317,7 @@ func (p *OpenAIChatProvider) buildRequest(req *InvokeRequest, stream bool) (*cha
 	}
 
 	for _, td := range req.Tools {
-		params := map[string]any{
-			"type":       td.Parameters.Type,
-			"properties": td.Parameters.Properties,
-		}
+		params := td.Parameters.Schema()
 		if params["type"] == "" {
 			params["type"] = "object"
 		}

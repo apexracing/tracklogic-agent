@@ -21,6 +21,7 @@ type AnthropicProvider struct {
 	baseURL    string
 	modelID    string
 	httpClient *http.Client
+	headers    http.Header
 	logger     *slog.Logger
 	version    string
 }
@@ -30,6 +31,11 @@ type AnthropicConfig struct {
 	BaseURL string
 	ModelID string
 	Timeout time.Duration
+	Logger  *slog.Logger
+	// HTTPClient is cloned before use. If its Timeout is zero, Timeout above is
+	// applied to the clone. Headers can override default request headers.
+	HTTPClient *http.Client
+	Headers    http.Header
 }
 
 func NewAnthropic(cfg AnthropicConfig) *AnthropicProvider {
@@ -39,15 +45,20 @@ func NewAnthropic(cfg AnthropicConfig) *AnthropicProvider {
 	if cfg.ModelID == "" {
 		cfg.ModelID = "claude-sonnet-4-20250514"
 	}
-	if cfg.Timeout == 0 {
+	if cfg.Timeout <= 0 {
 		cfg.Timeout = 60 * time.Second
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
 	}
 	return &AnthropicProvider{
 		apiKey:     cfg.APIKey,
 		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
 		modelID:    cfg.ModelID,
-		httpClient: &http.Client{Timeout: cfg.Timeout},
-		logger:     slog.With("component", "model", "provider", "anthropic", "model_id", cfg.ModelID),
+		httpClient: configuredHTTPClient(cfg.HTTPClient, cfg.Timeout),
+		headers:    cfg.Headers.Clone(),
+		logger:     logger.With("component", "model", "provider", "anthropic", "model_id", cfg.ModelID),
 		version:    "2023-06-01",
 	}
 }
@@ -119,6 +130,9 @@ type anthropicStreamEvent struct {
 }
 
 func (p *AnthropicProvider) Invoke(ctx context.Context, req *InvokeRequest) (*InvokeResponse, error) {
+	if err := validateInvokeRequest(req); err != nil {
+		return nil, err
+	}
 	apiReq, err := p.buildRequest(req, false)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
@@ -139,29 +153,29 @@ func (p *AnthropicProvider) Invoke(ctx context.Context, req *InvokeRequest) (*In
 
 	resp, err := p.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, types.WrapError(types.ErrAPIError, "http request failed", err)
+		return nil, modelTransportError(err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, types.WrapError(types.ErrAPIError,
-			fmt.Sprintf("API returned status %d", resp.StatusCode),
-			fmt.Errorf("%s", string(respBody)))
+		return nil, modelHTTPError(p.Provider(), resp)
 	}
 
 	var apiResp anthropicAPIResponse
-	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+	if err := decodeModelJSON(resp.Body, &apiResp); err != nil {
+		return nil, err
 	}
 
 	return parseAnthropicResponse(&apiResp), nil
 }
 
 func (p *AnthropicProvider) InvokeStream(ctx context.Context, req *InvokeRequest) (<-chan ResponseChunk, error) {
+	if err := validateInvokeRequest(req); err != nil {
+		return nil, err
+	}
 	apiReq, err := p.buildRequest(req, true)
 	if err != nil {
-		return nil, err
+		return nil, modelTransportError(err)
 	}
 
 	body, err := json.Marshal(apiReq)
@@ -177,7 +191,7 @@ func (p *AnthropicProvider) InvokeStream(ctx context.Context, req *InvokeRequest
 
 	resp, err := p.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, err
+		return nil, modelTransportError(err)
 	}
 
 	ch := make(chan ResponseChunk, 64)
@@ -186,10 +200,7 @@ func (p *AnthropicProvider) InvokeStream(ctx context.Context, req *InvokeRequest
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			respBody, _ := io.ReadAll(resp.Body)
-			ch <- ResponseChunk{Error: types.WrapError(types.ErrAPIError,
-				fmt.Sprintf("API returned status %d", resp.StatusCode),
-				fmt.Errorf("%s", string(respBody)))}
+			emitResponseChunk(ctx, ch, ResponseChunk{Error: modelHTTPError(p.Provider(), resp)})
 			return
 		}
 
@@ -209,13 +220,14 @@ func (p *AnthropicProvider) InvokeStream(ctx context.Context, req *InvokeRequest
 			}
 			data := strings.TrimPrefix(line, "data: ")
 			if data == "[DONE]" {
-				ch <- ResponseChunk{Done: true}
+				emitResponseChunk(ctx, ch, ResponseChunk{Done: true})
 				return
 			}
 
 			var evt anthropicStreamEvent
 			if err := json.Unmarshal([]byte(data), &evt); err != nil {
-				continue
+				emitResponseChunk(ctx, ch, ResponseChunk{Error: modelStreamError("decode messages stream event", err)})
+				return
 			}
 
 			switch evt.Type {
@@ -233,7 +245,9 @@ func (p *AnthropicProvider) InvokeStream(ctx context.Context, req *InvokeRequest
 				switch evt.Delta.Type {
 				case "text_delta":
 					if evt.Delta.Text != "" {
-						ch <- ResponseChunk{Content: evt.Delta.Text}
+						if !emitResponseChunk(ctx, ch, ResponseChunk{Content: evt.Delta.Text}) {
+							return
+						}
 					}
 				case "input_json_delta":
 					if acc, ok := tools[evt.Index]; ok {
@@ -242,7 +256,7 @@ func (p *AnthropicProvider) InvokeStream(ctx context.Context, req *InvokeRequest
 				}
 			case "content_block_stop":
 				if acc, ok := tools[evt.Index]; ok {
-					ch <- ResponseChunk{
+					if !emitResponseChunk(ctx, ch, ResponseChunk{
 						ToolCall: &types.ToolCall{
 							ID:   acc.id,
 							Type: "function",
@@ -251,6 +265,8 @@ func (p *AnthropicProvider) InvokeStream(ctx context.Context, req *InvokeRequest
 								Arguments: acc.args,
 							},
 						},
+					}) {
+						return
 					}
 					delete(tools, evt.Index)
 				}
@@ -271,17 +287,19 @@ func (p *AnthropicProvider) InvokeStream(ctx context.Context, req *InvokeRequest
 						TotalTokens:      evt.Usage.InputTokens + evt.Usage.OutputTokens,
 					}
 				}
-				ch <- rc
+				emitResponseChunk(ctx, ch, rc)
 				return
 			case "error":
-				ch <- ResponseChunk{Error: fmt.Errorf("stream error: %s", data), Done: true}
+				emitResponseChunk(ctx, ch, ResponseChunk{Error: modelStreamError("messages stream returned an error", fmt.Errorf("%s", data)), Done: true})
 				return
 			}
 		}
 
 		if err := scanner.Err(); err != nil {
-			ch <- ResponseChunk{Error: err}
+			emitResponseChunk(ctx, ch, ResponseChunk{Error: modelStreamError("read messages stream", err)})
+			return
 		}
+		emitResponseChunk(ctx, ch, ResponseChunk{Error: modelStreamError("messages stream ended before completion", io.EOF)})
 	}()
 
 	return ch, nil
@@ -291,6 +309,7 @@ func (p *AnthropicProvider) setHeaders(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", p.apiKey)
 	req.Header.Set("anthropic-version", p.version)
+	applyCustomHeaders(req, p.headers)
 }
 
 func (p *AnthropicProvider) buildRequest(req *InvokeRequest, stream bool) (*anthropicRequest, error) {
@@ -311,10 +330,7 @@ func (p *AnthropicProvider) buildRequest(req *InvokeRequest, stream bool) (*anth
 	}
 
 	for _, td := range req.Tools {
-		schema := map[string]any{
-			"type":       td.Parameters.Type,
-			"properties": td.Parameters.Properties,
-		}
+		schema := td.Parameters.Schema()
 		if schema["type"] == "" {
 			schema["type"] = "object"
 		}

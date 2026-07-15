@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -87,6 +88,9 @@ func (n *StepNode) ID() string     { return n.id }
 func (n *StepNode) Type() NodeType { return NodeTypeStep }
 
 func (n *StepNode) Execute(ctx context.Context, input string, state *State) (string, error) {
+	if n.Agent == nil {
+		return "", fmt.Errorf("step %s has no agent", n.id)
+	}
 	agentInput := input
 	if n.InputStateKey != "" && state != nil {
 		if value, exists := state.Get(n.InputStateKey); exists {
@@ -98,6 +102,9 @@ func (n *StepNode) Execute(ctx context.Context, input string, state *State) (str
 	}
 	output := n.Agent.Run(ctx, agentInput)
 	if !output.Success {
+		if output.Err != nil {
+			return "", fmt.Errorf("step %s failed: %w", n.id, output.Err)
+		}
 		return "", fmt.Errorf("step %s failed: %s", n.id, output.Error)
 	}
 	if n.AfterExecute != nil && state != nil {
@@ -124,6 +131,9 @@ func (n *ConditionNode) ID() string     { return n.id }
 func (n *ConditionNode) Type() NodeType { return NodeTypeCondition }
 
 func (n *ConditionNode) Execute(ctx context.Context, input string, state *State) (string, error) {
+	if n.Condition == nil {
+		return "", fmt.Errorf("condition %s has no predicate", n.id)
+	}
 	result, err := n.Condition(input, state)
 	if err != nil {
 		return "", fmt.Errorf("condition %s error: %w", n.id, err)
@@ -155,6 +165,12 @@ func (n *LoopNode) ID() string     { return n.id }
 func (n *LoopNode) Type() NodeType { return NodeTypeLoop }
 
 func (n *LoopNode) Execute(ctx context.Context, input string, state *State) (string, error) {
+	if n.Condition == nil {
+		return input, fmt.Errorf("loop %s has no condition", n.id)
+	}
+	if isNilNode(n.BodyNode) {
+		return input, fmt.Errorf("loop %s has no body", n.id)
+	}
 	current := input
 	for i := 0; i < n.MaxIter; i++ {
 		select {
@@ -184,7 +200,7 @@ type ParallelNode struct {
 }
 
 func NewParallelNode(id string, nodes ...Node) *ParallelNode {
-	return &ParallelNode{id: id, Nodes: nodes}
+	return &ParallelNode{id: id, Nodes: append([]Node(nil), nodes...)}
 }
 
 func (n *ParallelNode) ID() string     { return n.id }
@@ -199,6 +215,10 @@ func (n *ParallelNode) Execute(ctx context.Context, input string, state *State) 
 	var wg sync.WaitGroup
 
 	for i, node := range n.Nodes {
+		if isNilNode(node) {
+			results[i] = nodeResult{err: fmt.Errorf("parallel node %s child %d is nil", n.id, i)}
+			continue
+		}
 		wg.Add(1)
 		go func(idx int, nd Node) {
 			defer wg.Done()
@@ -210,10 +230,14 @@ func (n *ParallelNode) Execute(ctx context.Context, input string, state *State) 
 
 	var parts []string
 	for i, r := range results {
+		childID := fmt.Sprintf("child_%d", i)
+		if !isNilNode(n.Nodes[i]) {
+			childID = n.Nodes[i].ID()
+		}
 		if r.err != nil {
-			parts = append(parts, fmt.Sprintf("[%s] error: %v", n.Nodes[i].ID(), r.err))
+			parts = append(parts, fmt.Sprintf("[%s] error: %v", childID, r.err))
 		} else {
-			parts = append(parts, fmt.Sprintf("[%s] %s", n.Nodes[i].ID(), r.output))
+			parts = append(parts, fmt.Sprintf("[%s] %s", childID, r.output))
 		}
 	}
 	return strings.Join(parts, "\n"), nil
@@ -228,27 +252,61 @@ type Workflow struct {
 }
 
 type WorkflowConfig struct {
-	ID   string
-	Name string
+	ID     string
+	Name   string
+	Nodes  []Node
+	Logger *slog.Logger
 }
 
 func NewWorkflow(cfg WorkflowConfig) *Workflow {
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Workflow{
 		ID:           cfg.ID,
 		Name:         cfg.Name,
+		Nodes:        append([]Node(nil), cfg.Nodes...),
 		initialState: NewState(nil),
-		logger:       slog.With("component", "workflow", "name", cfg.Name),
+		logger:       logger.With("component", "workflow", "name", cfg.Name),
 	}
 }
 
+// AddNode appends a node during workflow construction. A Workflow must be
+// treated as immutable after it is registered or first run.
 func (w *Workflow) AddNode(node Node) {
 	w.Nodes = append(w.Nodes, node)
+}
+
+// Validate checks invariants that can be established before execution.
+func (w *Workflow) Validate() error {
+	if w == nil {
+		return fmt.Errorf("workflow is required")
+	}
+	if w.Name == "" || w.Name != strings.TrimSpace(w.Name) {
+		return fmt.Errorf("workflow name must be non-empty and must not have surrounding whitespace")
+	}
+	seen := make(map[string]struct{}, len(w.Nodes))
+	for index, node := range w.Nodes {
+		if isNilNode(node) {
+			return fmt.Errorf("workflow %q node %d is nil", w.Name, index)
+		}
+		if node.ID() == "" {
+			return fmt.Errorf("workflow %q node %d has no id", w.Name, index)
+		}
+		if _, duplicate := seen[node.ID()]; duplicate {
+			return fmt.Errorf("workflow %q has duplicate node id %q", w.Name, node.ID())
+		}
+		seen[node.ID()] = struct{}{}
+	}
+	return nil
 }
 
 type WorkflowResult struct {
 	Output   string
 	Success  bool
 	Error    string
+	Err      error `json:"-"`
 	State    map[string]any
 	Duration time.Duration
 	StepLogs []StepLog
@@ -264,6 +322,12 @@ type StepLog struct {
 
 func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 	start := time.Now()
+	if err := w.Validate(); err != nil {
+		return &WorkflowResult{Success: false, Error: err.Error(), Err: err, Duration: time.Since(start)}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	w.logger.Info("workflow started", "nodes", len(w.Nodes))
 
 	state := NewState(w.initialState.Snapshot())
@@ -274,8 +338,9 @@ func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 	for _, node := range w.Nodes {
 		select {
 		case <-ctx.Done():
+			runErr := fmt.Errorf("workflow cancelled: %w", ctx.Err())
 			return &WorkflowResult{
-				Output: current, Success: false, Error: "workflow cancelled",
+				Output: current, Success: false, Error: runErr.Error(), Err: runErr,
 				State: state.Snapshot(), Duration: time.Since(start), StepLogs: stepLogs,
 			}
 		default:
@@ -293,8 +358,9 @@ func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 				NodeID: node.ID(), NodeType: node.Type(),
 				Duration: duration, Success: false, Error: err.Error(),
 			})
+			workflowErr := fmt.Errorf("node %s failed: %w", node.ID(), err)
 			return &WorkflowResult{
-				Output: current, Success: false, Error: fmt.Sprintf("node %s failed: %s", node.ID(), err),
+				Output: current, Success: false, Error: workflowErr.Error(), Err: workflowErr,
 				State: state.Snapshot(), Duration: time.Since(start), StepLogs: stepLogs,
 			}
 		}
@@ -310,6 +376,19 @@ func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 	return &WorkflowResult{
 		Output: current, Success: true,
 		State: state.Snapshot(), Duration: time.Since(start), StepLogs: stepLogs,
+	}
+}
+
+func isNilNode(node Node) bool {
+	if node == nil {
+		return true
+	}
+	value := reflect.ValueOf(node)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
 	}
 }
 

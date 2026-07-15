@@ -109,7 +109,9 @@ flowchart TD
 | 模型输出文本内容 | 正常终止 | 模型认为已经完成，直接回答 |
 | 达到最大循环次数 | 强制终止 | 防止无限循环（模型可能陷入死循环） |
 | Context 取消 | 立即终止 | 外部取消信号（超时、用户取消） |
-| 工具执行错误 | 返回错误 | 无法继续执行 |
+| 工具执行错误 | 写成 `error: ...` 的 Tool 消息并继续 | 让模型有机会修正参数、换工具或解释失败 |
+
+工具错误不会立即把 `Run` 标记失败，这是验证循环的重要取舍：可恢复错误交给下一轮推理，最终仍由 Context 和 MaxLoops 限制成本。如果业务要求某类错误必须立即终止，应在 Tool/Agent 扩展策略中显式分类。
 
 ---
 
@@ -117,13 +119,16 @@ flowchart TD
 
 ```go
 type Agent struct {
-	Name         string           // Agent 名称（日志和追踪用）
-	SystemPrompt string           // 系统提示词（每次运行注入）
-	Model        model.Model      // 底层 LLM 模型（可被 Team 替换）
-	ToolRegistry *tool.Registry   // 可用工具注册表
-	Memory       memory.Memory    // 会话记忆存储
-	MaxLoops     int              // 最大循环次数
-	logger       *slog.Logger     // 结构化日志
+	mu                  sync.RWMutex // 保护可变配置引用
+	runGate             chan struct{} // 串行化共享 Memory 的完整 Run
+	name                string
+	systemPrompt        string
+	model               model.Model
+	toolRegistry        *tool.Registry
+	memory              memory.Memory
+	maxLoops            int
+	checkToolPermission func(string) error
+	logger              *slog.Logger
 }
 ```
 
@@ -143,9 +148,13 @@ Registry 在多 Agent 间共享。多个 Agent 可能使用相同的工具集，
 
 Agent 的运行不是孤立事件。连续的 Run 调用共享同一个 Memory 实例，形成对话上下文。
 
+**为什么还需要 runGate，Memory 自己不是已经有锁了吗？**
+
+Memory 的锁只能保证单次 `Add`/`Snapshot` 不发生数据竞争，不能保证“一次 User → Model → Tool → Model”的多步事务不与另一个 Run 交错。`runGate` 把同一有状态 Agent 的完整 Run 串行化；它使用容量为 1 的通道，因此等待者可以同时监听 `ctx.Done()`，在截止时间到达时退出。不同 Agent 仍可并发运行。
+
 **为什么 logger 是 private 字段？**
 
-日志实现是内部细节，不应暴露给调用方。用户通过 Harness 的 `Config.LogLevel` 控制日志行为。
+日志对象不暴露为可变字段。用户可以通过 Harness 的 `Config.LogLevel` 使用默认 logger，也可以用 `agent.WithLogger` 注入应用 logger。
 
 ---
 
@@ -158,8 +167,12 @@ type AgentConfig struct {
 	SystemPrompt string          // 系统提示词
 	Model        model.Model     // LLM 模型
 	ToolRegistry *tool.Registry  // 工具注册表
+	RestrictTools bool           // 是否启用 Agent 级工具白名单
+	AllowedTools []string        // 白名单；启用后可为空，表示无工具
 	Memory       memory.Memory   // 记忆（可选，默认使用 BufferMemory）
 	MaxLoops     int             // 最大循环次数（默认 10）
+	CheckToolPermission func(string) error
+	Logger       *slog.Logger
 }
 ```
 
@@ -196,6 +209,10 @@ func WithTemperature(t float64) RunOption {
 - temperature: 0.7（平衡创造性和确定性）
 - maxTokens: 4096
 
+Option 在进入 Memory 和 Model 前统一校验：`maxLoops > 0`、`maxTokens > 0`、temperature 位于 `[0,2]`，并且本次 Model 非 nil。非法 Option 返回 `INVALID_CONFIG`，不会出现“循环零次后误报 max loops”或运行到 Provider 才 panic。
+
+`RestrictTools=false` 保留兼容行为：Agent 看见 Registry 中的全部工具。启用后，`AllowedTools` 是精确能力集合；`buildToolDefinitions` 只发送白名单定义，`executeToolCall` 也会拒绝白名单外的名称。可见性过滤是引导模型，执行检查才是安全边界。
+
 ---
 
 ## 3.4 Run 方法详解（核心循环）
@@ -203,8 +220,16 @@ func WithTemperature(t float64) RunOption {
 这是整个框架中最重要的一段代码。每次 `Run()` 调用都是一个完整的验证循环。
 
 ```go
+// 教学展开版：为突出循环，下面使用了 a.Model/a.Memory/a.MaxLoops 等
+// 可读名称。真实 Agent 字段是私有的，并通过短时间持有 RWMutex 读取。
 func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOutput {
 	// ── 阶段 1：初始化 ──
+	ctx, runID := ensureRunContext(ctx, a.Name())
+	if err := a.acquireRun(ctx); err != nil {
+		return cancelledOutput(runID, err) // 教学简写
+	}
+	defer a.releaseRun()
+
 	// 解析选项，将默认配置与用户传入的选项合并
 	cfg := &runConfig{
 		maxLoops:    a.MaxLoops,
@@ -212,7 +237,10 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 		maxTokens:   4096,
 	}
 	for _, opt := range opts {
-		opt(cfg)
+		if opt != nil { opt(cfg) }
+	}
+	if err := validateRunConfig(cfg); err != nil {
+		return failedOutput(runID, err) // 教学简写
 	}
 
 	start := time.Now()
@@ -226,6 +254,7 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 	})
 
 	var lastContent string
+	var allToolCalls []types.ToolCall
 	totalTokens := 0
 	loopCount := 0
 
@@ -237,9 +266,11 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 		select {
 		case <-ctx.Done():
 			a.logger.Warn("run cancelled", "loop", loopCount)
+			runErr := types.WrapError(types.ErrRunCancelled, "context cancelled", ctx.Err())
 			return &RunOutput{
 				Success:   false,
-				Error:     "context cancelled",
+				Error:     runErr.Error(),
+				Err:       runErr,
 				LoopCount: loopCount,
 			}
 		default:
@@ -263,20 +294,21 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 		var resp *model.InvokeResponse
 		var err error
 		if cfg.streamFunc != nil {
-			ch, streamErr := a.Model.InvokeStream(ctx, req)
+			ch, streamErr := cfg.model.InvokeStream(ctx, req)
 			if streamErr != nil {
 				err = streamErr
 			} else {
 				resp, err = consumeStream(ctx, ch, cfg.streamFunc)
 			}
 		} else {
-			resp, err = a.Model.Invoke(ctx, req)
+			resp, err = cfg.model.Invoke(ctx, req)
 		}
 		if err != nil {
 			a.logger.Error("model invoke failed", "error", err)
 			return &RunOutput{
 				Success:   false,
 				Error:     err.Error(),
+				Err:       err,
 				LoopCount: loopCount,
 			}
 		}
@@ -296,6 +328,7 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 
 		// 2f. 检查是否有工具调用
 		if len(resp.ToolCalls) > 0 {
+			allToolCalls = append(allToolCalls, resp.ToolCalls...)
 			a.logger.Info("processing tool calls",
 				"count", len(resp.ToolCalls),
 				"loop", loopCount)
@@ -336,6 +369,8 @@ func (a *Agent) Run(ctx context.Context, input string, opts ...RunOption) *RunOu
 
 		return &RunOutput{
 			Content:     lastContent,
+			ToolCalls:   allToolCalls,
+			Messages:    a.Memory.Snapshot(),
 			Success:     true,
 			TotalTokens: totalTokens,
 			LoopCount:   loopCount,
@@ -471,15 +506,47 @@ func (a *Agent) executeToolCall(ctx context.Context, tc types.ToolCall) (string,
 
 ```go
 type RunOutput struct {
-	Content     string   `json:"content"`      // 最终输出文本
-	Success     bool     `json:"success"`       // 是否成功
-	Error       string   `json:"error,omitempty"`  // 错误信息
-	TotalTokens int      `json:"total_tokens"`  // 总 Token 消耗
-	LoopCount   int      `json:"loop_count"`    // 实际循环次数
+	RunID       string           `json:"run_id"`
+	Content     string           `json:"content"`
+	ToolCalls   []types.ToolCall `json:"tool_calls,omitempty"`
+	Messages    []types.Message  `json:"messages,omitempty"`
+	Success     bool             `json:"success"`
+	Error       string           `json:"error,omitempty"`
+	Err         error            `json:"-"`
+	TotalTokens int              `json:"total_tokens"`
+	LoopCount   int              `json:"loop_count"`
 }
 ```
 
-`RunOutput` 不仅返回文本内容，还携带了元信息——成功与否、Token 消耗、循环次数。这些信息对外部监控和调试至关重要。
+各字段不是随意堆在一起的，它们分别服务不同调用方：
+
+| 字段 | 主要用途 | 容易误解的边界 |
+|---|---|---|
+| `RunID` | 调用日志、错误工单和上层追踪的关联键 | Agent 自动生成；不是业务幂等键，也不自动表示父子关系 |
+| `Content` | 给最终用户或下游节点的文本 | 失败时可能为空，不应忽略 `Success` |
+| `Error` / `Err` | 序列化错误文本 / 进程内结构化错误链 | 跨网络只保留 Error；进程内用 `errors.As(output.Err, ...)` |
+| `ToolCalls` | 审计本次 Run 中模型请求过的全部工具 | 是跨循环汇总，不只是最后一轮 |
+| `Messages` | 调试上下文、理解 Memory 当前状态 | 是整个 Agent Memory 快照，可能包含以前的 Run；进入 Memory 前的早期失败可为空 |
+| `TotalTokens` | 成本和容量分析 | 依赖 Provider 是否返回 Usage |
+| `LoopCount` | 发现工具循环或 Prompt 问题 | 包含最终产生文本的模型调用轮次 |
+
+`ToolCalls` 汇总本次 Run 中模型请求过的工具调用；`Messages` 是 Agent 当前 Memory 的快照，可能包含该 Agent 之前 Run 的历史，并不等于“仅本次新增消息”。模型调用失败、取消或循环超限时也尽量保留已产生的 ToolCalls、Messages、Token 和循环数，避免失败路径丢失排错证据。这正是为什么生产多会话不能让多个用户共享同一个 Agent/Memory。
+
+`Err` 标记为 `json:"-"`，因为 Go error 链不适合作为稳定的网络协议。进程内调用者可以识别 `HarnessError` / `HTTPError`；跨进程 API 应由应用把它转换成自己版本化的错误 DTO。
+
+### RunID 如何沿调用链传播
+
+`Agent.Run` 进入时会调用内部的 `ensureRunContext`：
+
+1. Context 为 nil 时先替换为 `context.Background()`；
+2. 已有 `RunContext` 时复制一份，保留调用方提供的 Session/User/Workflow 字段；
+3. 缺少 `RunID` 时生成 128 位随机标识，缺少 `AgentID` 时填入 Agent 名称；
+4. 把新 Context 传给 Model 和 Tool；Tool 内如果继续调用 MCP，同一个 Context 也会继续向下传播；
+5. 返回前把相同标识写入 `RunOutput.RunID`。
+
+之所以复制 `RunContext` 而不原地修改指针，是为了避免多个并发 Agent 共享父 Context 时互相覆盖 `AgentID`。这是 Context 的重要设计习惯：把它当作不可变的调用链载体，而不是跨 goroutine 的可变参数袋。
+
+当前库只负责在调用链中传递 RunContext。应用可以在入口日志中记录 `RunOutput.RunID`，自定义 Model/Tool 也可以通过 `types.RunContextFrom(ctx)` 读取关联信息。RunID 是通用的排错关联键，不代表本库拥有数据分析或报告职责。
 
 ---
 
@@ -577,7 +644,7 @@ sequenceDiagram
     A->>L: Invoke(messages, tools)
     L-->>A: Content: "订单已签收，快递在运输中..."
     A->>M: Add(RoleAssistant, "订单已签收...")
-    A-->>U: RunOutput{Content, Success:true, LoopCount:2}
+    A-->>U: RunOutput{Content, Success:true, LoopCount:3}
 ```
 
 注意每一轮循环中 `buildMessages()` 返回的列表越来越长——这就是为什么需要 Memory 的裁剪机制。
@@ -602,6 +669,14 @@ Agent 注册的工具集在运行期间可能发生变化。如果模型调用�
 
 极端情况下，模型可能反复调用同一个工具并返回相同结果，形成无限循环。`MaxLoops` 是最终的兜底机制。
 
+### 3.8.5 同一 Agent 的并发 Run
+
+后到的 Run 在 `runGate` 等待，不会先把自己的 User Message 写进共享 Memory。若等待 Context 到期，它返回 `RUN_CANCELLED`，且不修改 Memory。这个保证只解决消息交错；多用户隔离仍应使用 Session → Agent/Memory 路由。
+
+### 3.8.6 非法 RunOption
+
+零/负循环数、零/负 Token 上限、越界 temperature 或 nil Model 都在运行开始前失败。错误结果仍包含 RunID，便于调用方关联请求。
+
 ---
 
 ## 3.9 本章小结
@@ -623,5 +698,5 @@ Agent 注册的工具集在运行期间可能发生变化。如果模型调用�
 
 1. 给 Agent 添加 `PreRun` 和 `PostRun` 钩子，在 Run 前后执行自定义逻辑
 2. 将 `WithStream` 的回调升级为结构化事件通道（例如区分 content / tool_call / done），便于上层做 SSE
-3. 为 `RunOutput` 添加 `Messages []types.Message` 字段，返回本次运行的所有消息记录
+3. 为 `RunOutput.Messages` 编写跨两次 Run 的测试，确认它返回 Agent Memory 快照而不是仅本次增量
 4. 实现一个简单的 `maxLoops` 检测机制：当连续 3 次调用同一个工具且参数相同时，强制终止

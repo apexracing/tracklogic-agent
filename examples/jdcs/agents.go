@@ -23,7 +23,7 @@ func SetupAgents(h *agent.Harness) (*engine.Agent, *engine.Agent, *engine.Agent,
 		}
 	}
 
-	triageAgent := h.NewAgent("triage_agent",
+	triageAgent, err := h.CreateAgentWithTools("triage_agent",
 		`你是京东智能客服的分流系统。
 你的职责是分析用户输入，判断用户意图。
 
@@ -38,9 +38,13 @@ func SetupAgents(h *agent.Harness) (*engine.Agent, *engine.Agent, *engine.Agent,
 - unknown: 无法识别
 
 分析用户输入后，调用 classify_intent 工具返回分类结果。`,
+		"classify_intent",
 	)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 
-	orderAgent := h.NewAgent("order_agent",
+	orderAgent, err := h.CreateAgentWithTools("order_agent",
 		`你是京东智能客服的订单专员。
 你可以查询订单信息、物流状态。
 如果用户需要退款，转交给退款专员。
@@ -48,9 +52,14 @@ func SetupAgents(h *agent.Harness) (*engine.Agent, *engine.Agent, *engine.Agent,
 如果无法处理，转人工客服。
 
 请使用工具获取数据后，用中文友好回答。`,
+		"get_user_info", "query_order", "list_user_orders", "track_logistics",
+		"recommend_product", "transfer_human", "send_coupon",
 	)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 
-	refundAgent := h.NewAgent("refund_agent",
+	refundAgent, err := h.CreateAgentWithTools("refund_agent",
 		`你是京东智能客服的退款专员。
 你处理用户的退款、退货申请。
 注意：
@@ -60,7 +69,11 @@ func SetupAgents(h *agent.Harness) (*engine.Agent, *engine.Agent, *engine.Agent,
 
 如果用户不满，可以配合发优惠券安抚。
 无法处理的请转人工。`,
+		"get_user_info", "query_order", "create_refund", "transfer_human", "send_coupon",
 	)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 
 	return triageAgent, orderAgent, refundAgent, nil
 }

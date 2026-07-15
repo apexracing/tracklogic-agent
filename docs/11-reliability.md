@@ -1,104 +1,157 @@
 # 第 11 章 容错与可靠性
 
-### 设计思路：默认一切都会出错
+### 设计思路：先分清故障，再决定策略
 
-生产环境中，外部依赖的故障是常态而非异常。Harness 的可靠性设计基于"故障假设原则"：
+> 本章同时包含当前实现和扩展设计。当前仓库已经实现 HTTP 超时、Context 取消、有界 Agent 循环、响应大小限制、错误分类和结构化日志；指数退避、断路器与自动降级尚未接入运行时。
+
+“默认一切都会出错”不是让每个错误都重试，而是要求系统在设计阶段回答：故障发生在哪里、是否短暂、操作是否幂等、谁拥有重试预算、失败后保留什么诊断证据。
+
+## 11.1 先画出故障边界
+
+一次 Agent 请求跨过多个边界，每个边界的失败含义不同：
 
 ```mermaid
-graph TD
-    subgraph FAULTS["常见故障"]
-        F1["API 超时"]
-        F2["API 限流 429"]
-        F3["工具服务宕机"]
-        F4["模型返回异常"]
-    end
-    
-    subgraph STRATEGIES["应对策略"]
-        S1["超时控制<br/>context.WithTimeout"]
-        S2["指数退避重试<br/>1s→2s→4s"]
-        S3["断路器<br/>连续失败→熔断"]
-        S4["降级<br/>返回缓存/默认值"]
-    end
-    
-    F1 --> S1
-    F1 --> S2
-    F2 --> S2
-    F3 --> S3
-    F3 --> S4
-    F4 --> S4
-    
-    style FAULTS fill:#f8d7da
-    style STRATEGIES fill:#d4edda
+flowchart LR
+    U["应用调用"] --> H["Harness"]
+    H --> A["Agent 循环"]
+    A --> M["Model Provider"]
+    M --> API["模型 HTTP API"]
+    A --> T["Tool"]
+    T --> B["业务系统"]
 ```
 
-每种故障都有对应的策略，确保系统在任何情况下都能优雅降级。
+| 故障位置 | 常见错误 | 通常由谁处理 |
+|---|---|---|
+| Harness 输入边界 | 空输入、过长、注入模式 | 立即拒绝，不重试 |
+| Agent 循环 | 取消、超过 MaxLoops | 应用调整预算或任务，不自动重试 |
+| Model Provider | 网络抖动、429、5xx、响应解析失败 | Provider 分类错误；调用应用决定是否重试 |
+| Tool 参数 | JSON 错误、缺少必填字段 | 写回模型修正，或终止 |
+| Tool 业务执行 | 订单不存在、余额不足 | 业务失败，不重试 |
+| Tool 外部依赖 | 超时、连接重置、临时 503 | Tool/服务客户端在幂等前提下重试 |
+| Workflow | 某步骤失败、进程重启 | 应用层决定是否重放或恢复 |
 
-可靠性是生产系统的生命线。本章为 Harness 构建容错机制，确保 Agent 在故障面前仍能正常运行。
+设计可靠性时最常见的错误，是只看到“发生 error”，却丢失错误所属边界。`HarnessError.Code` 的价值就在于把部分故障变成可分类数据。
 
----
+## 11.2 当前代码已经提供的可靠性底座
 
-## 11.1 故障假设原则
+### 11.2.1 Context 取消传播
 
-> 默认一切都会出错。
+`Agent.Run` 在每轮开始检查 `ctx.Done()`，并把同一个 Context 传给 Model 和 Tool。Team、Workflow 以及 MCP 的 HTTP 请求也继续向下传递。
 
-| 故障场景 | 影响 | 应对策略 |
-|---------|------|---------|
-| API 超时 | 模型无响应 | 超时控制 + 重试 |
-| API 限流（429） | 请求被拒绝 | 指数退避重试 |
-| 工具服务宕机 | 工具调用失败 | 降级 + 错误反馈 |
-| 模型返回异常 | 格式解析失败 | 优雅降级 |
-| 级联故障 | 链式崩溃 | 断路器 |
+```go
+runCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
 
-### 常见故障的分布
-
+output := runtimeAgent.Run(runCtx, input)
+if !output.Success {
+	// context 取消会形成 RUN_CANCELLED，Provider/Tool 也可能直接返回 ctx.Err()
+}
 ```
-用户输入错误的概率：高
-模型调用超时的概率：中
-工具执行失败的概率：中
-API Key 错误的概率：低（但一旦发生持续失败）
+
+为什么使用 Context 而不是一个全局 `Stop` 标志？因为 Context 可以沿调用链传播取消和截止时间，不需要每个子系统共享可变全局状态。
+
+当前边界也要看清：Agent 只在循环边界主动检查取消。具体 Tool 是否及时停止，取决于它是否使用传入的 Context；不理会 Context 的阻塞 Tool 仍可能拖延返回。
+
+### 11.2.2 HTTP Client 超时
+
+Model Provider 使用配置中的 `timeout_seconds` 构造 HTTP Client，未设置或非正数时回退为 60 秒；MCP Client 的兜底是 30 秒。
+
+HTTP Client 超时与整次 Run 的 Context 截止时间是两个不同预算：
+
+```text
+实际可用时间 = min(HTTP Client 超时, Context 剩余时间)
 ```
 
-我们的容错策略应该优先处理**高频**和**中频**故障，对低频故障提供兜底。
+应用通常应让整次 Run 的截止时间覆盖业务 SLO，再把单次 Provider/Tool 超时设得更短，为错误处理留出余量。
 
----
+三个模型 Provider 还限制响应大小：普通成功响应最多 16 MiB，错误正文最多保留 8 KiB。限制错误正文同样重要，因为错误网关也可能返回超大 HTML；如果错误路径无界，它仍能耗尽进程内存。
 
-## 11.2 重试策略
+### 11.2.3 最大循环上限
 
-### 指数退避（Exponential Backoff）
+`MaxLoops` 防止模型不断请求工具导致无限成本。默认是 10，也可以按单次调用覆盖：
+
+```go
+output := runtimeAgent.Run(ctx, input, engine.WithMaxLoops(5))
+```
+
+达到上限返回 `MAX_LOOPS_EXCEEDED`。这通常不是网络瞬时故障，盲目重跑很可能重复消耗 Token；应检查 Prompt、工具错误消息和模型的工具选择。
+
+### 11.2.4 失败的工具结果会反馈给模型
+
+工具不存在、权限拒绝、参数校验失败或执行失败时，Agent 会把 `error: ...` 作为 Tool 消息写回 Memory，然后进入下一轮。这样模型有机会修正参数或向用户解释。
+
+这是一种局部恢复机制，但也有预算：同一错误可能被模型重复触发，最终由 `MaxLoops` 截止。生产扩展可以加入重复 ToolCall 检测或每类工具的失败计数。
+
+## 11.3 重试前必须回答的三个问题
+
+### 问题一：错误是否可能自行恢复？
+
+适合重试的通常是短暂故障：连接重置、429、部分 5xx、上游暂时不可用。不适合重试的是配置错误、鉴权失败、参数错误、权限拒绝和确定性的业务规则失败。
+
+对未知错误默认重试并不安全。更稳妥的默认是“不重试”，只有明确分类为 transient 的错误才进入策略。
+
+### 问题二：操作是否幂等？
+
+读取订单通常可安全重试；创建退款、发送邮件、扣款等写操作可能产生重复副作用。写操作要重试，至少需要一个稳定幂等键：
+
+```text
+用户请求 RunID + 业务动作 + 业务对象 ID
+               ↓
+refund:run-123:order-456
+```
+
+服务端必须存储并识别这个键。仅在客户端“希望它不要重复”不构成幂等保证。
+
+### 问题三：哪一层拥有重试？
+
+只选择最了解错误和幂等性的层。不要让网关、应用、Agent、Provider 和 Tool 同时各重试 3 次，否则最坏会放大成乘法调用。
+
+```text
+3（应用）× 3（Provider）× 3（HTTP SDK）= 27 次上游请求
+```
+
+推荐职责：
+
+- Provider 负责把模型 HTTP 的 429/短暂 5xx 分类为 `HTTPError`，但当前不会自动重试；
+- 业务 Tool 负责自己依赖的短暂故障；
+- 应用根据 `HTTPError.Retryable()`、剩余时间和请求语义决定是否重试或重放；
+- Agent 循环负责“模型看到工具结果后是否换方案”，它不是网络重试器。
+
+## 11.4 指数退避扩展设计
+
+下面是教学实现，**不是当前仓库的公共 API**：
 
 ```go
 type RetryStrategy struct {
-	MaxAttempts int           // 最大尝试次数
-	BaseDelay   time.Duration // 基础延迟
-	MaxDelay    time.Duration // 最大延迟
+	MaxAttempts int
+	BaseDelay   time.Duration
+	MaxDelay    time.Duration
 }
 
-func DefaultRetry() *RetryStrategy {
-	return &RetryStrategy{
-		MaxAttempts: 3,
-		BaseDelay:   1 * time.Second,
-		MaxDelay:    10 * time.Second,
-	}
-}
-
-func (r *RetryStrategy) Do(ctx context.Context, fn func(context.Context) error) error {
+func (r RetryStrategy) Do(
+	ctx context.Context,
+	isRetryable func(error) bool,
+	fn func(context.Context) error,
+) error {
 	var lastErr error
 	for attempt := 0; attempt < r.MaxAttempts; attempt++ {
 		if err := fn(ctx); err != nil {
 			lastErr = err
-			if isRetryable(err) && attempt < r.MaxAttempts-1 {
-				delay := r.BaseDelay * time.Duration(1<<attempt) // 指数: 1s, 2s, 4s
-				if delay > r.MaxDelay {
-					delay = r.MaxDelay
-				}
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(delay):
-				}
-				continue
+			if !isRetryable(err) || attempt == r.MaxAttempts-1 {
+				return err
 			}
-			return err // 不可重试或已达最大次数
+
+			delay := r.BaseDelay * time.Duration(1<<attempt)
+			if delay > r.MaxDelay { delay = r.MaxDelay }
+			// 生产实现还应加入随机 jitter，避免大量实例同时重试。
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+			continue
 		}
 		return nil
 	}
@@ -106,172 +159,108 @@ func (r *RetryStrategy) Do(ctx context.Context, fn func(context.Context) error) 
 }
 ```
 
-**指数退避计算**：
+这里有四个有意的设计：
 
-```
-attempt=0: delay = 1s × 2⁰ = 1s
-attempt=1: delay = 1s × 2¹ = 2s
-attempt=2: delay = 1s × 2² = 4s
-...
+1. 分类函数由调用层注入，通用重试器不猜测业务错误；
+2. 等待受 Context 控制，取消后不会继续睡眠；
+3. 延迟有上限，避免指数无限增长；
+4. 最大尝试次数包含第一次调用，预算含义明确。
+
+生产实现还应加入 full jitter，并记录 attempt、delay、最终错误和上游 request ID。
+
+## 11.5 断路器什么时候才有价值
+
+重试处理短暂故障，断路器处理“持续失败时不要继续施压”。它通常有三个状态：
+
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open: 失败达到阈值
+    Open --> HalfOpen: 冷却时间结束
+    HalfOpen --> Closed: 探测成功
+    HalfOpen --> Open: 探测失败
 ```
 
-### 哪些错误可重试？
+断路器必须按依赖实例或服务端点隔离。把所有工具共用一个全局断路器，会让一个物流服务的故障错误地熔断订单查询。
+
+实现时还要定义：
+
+- 统计连续失败还是滑动窗口失败率；
+- 哪些错误计入失败；
+- HalfOpen 同时允许几个探测请求；
+- Open 时返回什么可识别错误；
+- 状态是否需要跨进程共享。
+
+当前仓库没有内置断路器。初学者不应先实现复杂状态机；先把超时、错误分类和失败日志做好，确认确实存在级联压力后再加入。
+
+## 11.6 降级不是“返回一段看似成功的话”
+
+可靠降级必须保留真实性。例如订单服务不可用时，可以：
+
+- 明确告诉用户暂时无法查询；
+- 返回带时间戳的缓存，并标明可能过期；
+- 转人工并携带已收集的上下文；
+- 对非关键推荐功能返回空结果。
+
+不能在没有数据时让模型编造订单状态。降级结果应包含机器可识别的 `degraded` 或数据来源字段，便于调用应用区分正常成功。
+
+## 11.7 失败证据必须能被程序识别
+
+可靠性代码不能要求调用方解析自然语言错误字符串。当前实现提供两层机器可识别信息：
+
+- `*types.HarnessError` 表示 Harness 语义，例如 `RATE_LIMIT`、`MODEL_TIMEOUT`、`RUN_CANCELLED`；
+- `*model.HTTPError` 保存上游 `StatusCode`、`RequestID`、`RetryAfter` 和有界错误正文。
+
+两层错误通过 `%w` 包装保留，所以应使用 `errors.As` / `errors.Is`，不要做字符串包含判断：
 
 ```go
-func isRetryable(err error) bool {
-	var herr *types.HarnessError
-	if errors.As(err, &herr) {
-		switch herr.Code {
-		case types.ErrRateLimit, types.ErrModelTimeout, types.ErrAPIError:
-			return true
-		case types.ErrInvalidInput, types.ErrSecurityViolation, types.ErrInvalidConfig:
-			return false
-		}
-	}
-	return true // 未知错误默认可重试
+result := h.RunAgent(ctx, "assistant", input)
+var harnessErr *types.HarnessError
+var upstream *model.HTTPError
+err := result.Err
+
+switch {
+case errors.As(err, &upstream) && upstream.Retryable():
+	// 这里只得到“协议上可能短暂”的事实；仍要检查 Context 和重试预算。
+case errors.As(err, &harnessErr):
+	// 按 Harness 错误码处理，例如取消、输入错误或循环超限。
+default:
+	// 未分类错误默认不重试。
 }
 ```
 
----
+`RunOutput`、`TeamOutput` 和 `WorkflowResult` 都保留 `Err error`，并用 `json:"-"` 排除序列化；原有 `Error string` 继续作为兼容字段。Team/Workflow 包装下层失败时使用 `%w`，并行 Team 用 `errors.Join` 聚合多个 Agent 错误，所以 `errors.As` 仍能穿过编排层找到根因。
 
-## 11.3 断路器
+RunID、上游 request ID 和错误码足以让应用把一次失败与自己的请求日志关联起来。Harness 只提供这些通用证据，不负责数据分析、聚合或报告。
 
-断路器防止连续故障导致的级联崩溃。
+## 11.8 推荐实施顺序
 
-```go
-type CircuitBreaker struct {
-	mu           sync.Mutex
-	failures     int
-	maxFailures  int           // 触发断路的连续失败次数
-	resetTimeout time.Duration // 半开后等待恢复的时间
-	lastFailure  time.Time
-	state        string        // closed → open → half-open → closed
-}
+可靠性能力不是越多越好，建议按风险递增：
 
-func NewCircuitBreaker(maxFailures int, resetTimeout time.Duration) *CircuitBreaker {
-	return &CircuitBreaker{
-		maxFailures:  maxFailures,
-		resetTimeout: resetTimeout,
-		state:        "closed",
-	}
-}
+1. 为应用入口设置总 Context 截止时间；
+2. 为每个外部 Client 设置更短的单次超时；
+3. 保留结构化错误类型和上游状态码；
+4. 用 `errors.As` 保留并识别上游状态、request ID 和 Harness 错误码；
+5. 只对明确 transient 且幂等的请求加有限重试与 jitter；
+6. 从失败日志确认存在持续故障放大后，再加入按依赖隔离的断路器；
+7. 对写操作加入幂等键、审计记录和恢复流程；
+8. Workflow 需要重放时，再设计步骤持久化和补偿动作。
 
-func (cb *CircuitBreaker) Call(ctx context.Context, fn func(context.Context) error) error {
-	cb.mu.Lock()
-	if cb.state == "open" {
-		if time.Since(cb.lastFailure) > cb.resetTimeout {
-			cb.state = "half-open" // 尝试恢复
-		} else {
-			cb.mu.Unlock()
-			return fmt.Errorf("circuit breaker is open (service unavailable)")
-		}
-	}
-	cb.mu.Unlock()
+这个顺序体现一个原则：**先让失败可分类、可终止、可关联，再增加复杂恢复机制。**
 
-	err := fn(ctx)
+## 11.9 本章小结
 
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-
-	if err != nil {
-		cb.failures++
-		cb.lastFailure = time.Now()
-		if cb.failures >= cb.maxFailures {
-			cb.state = "open" // 打开断路器
-		}
-		return err
-	}
-
-	// 成功调用：重置
-	cb.failures = 0
-	cb.state = "closed"
-	return nil
-}
-```
-
-**状态机**：
-
-```
-closed (正常) → failures >= maxFailures → open (熔断)
-open → resetTimeout 过期 → half-open (尝试恢复)
-half-open → 成功 → closed
-half-open → 失败 → open (再次熔断)
-```
-
----
-
-## 11.4 超时控制
-
-超时是最基本的容错机制。Go 的 `context.WithTimeout` 提供了原生支持：
-
-```go
-// 在 Agent Run 中设置总超时
-runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-defer cancel()
-
-output := agent.Run(runCtx, input)
-```
-
-每层的超时时间：
-
-| 层 | 超时时间 | 说明 |
-|----|---------|------|
-| HTTP 客户端 | 60s | 单次 API 调用 |
-| Agent Run | 30s | 整次运行 |
-| 工具执行 | 10s | 单次工具调用 |
-
----
-
-## 11.5 可观测性基础
-
-### Metrics 收集
-
-```go
-type Metrics struct {
-	mu       sync.Mutex
-	counters map[string]int64      // 计数器
-	timings  map[string]time.Duration // 累计耗时
-}
-
-func (m *Metrics) Inc(name string) {
-	m.mu.Lock()
-	m.counters[name]++
-	m.mu.Unlock()
-}
-
-func (m *Metrics) Record(name string, d time.Duration) {
-	m.mu.Lock()
-	m.timings[name] += d
-	m.mu.Unlock()
-}
-```
-
-### 关键指标
-
-| 指标 | 类型 | 含义 |
-|------|------|------|
-| `agent.runs.total` | Counter | Agent 总运行次数 |
-| `agent.runs.success` | Counter | 成功次数 |
-| `agent.runs.failed` | Counter | 失败次数 |
-| `agent.run.duration` | Timing | 平均运行耗时 |
-| `model.invoke.count` | Counter | 模型调用次数 |
-| `model.tokens.total` | Counter | Token 消耗量 |
-| `tool.invoke.count` | Counter | 工具调用次数 |
-| `tool.invoke.failed` | Counter | 工具失败次数 |
-
----
-
-## 11.6 本章小结
-
-- 实现了指数退避重试策略（1s → 2s → 4s）
-- 实现了断路器模式，防止级联故障
-- 建立了分层超时控制体系
-- 设计了基础 Metrics 收集系统
-
----
+- 当前已实现：HTTP 超时、Context 取消、有界循环、响应限制、错误码和 slog 日志；
+- 当前未内置：自动重试、断路器、缓存降级和 Workflow 恢复；
+- 重试需要同时满足短暂故障、预算可控和操作幂等；
+- 重试应放在最了解错误语义的单一层级；
+- 断路器按依赖隔离，降级结果必须诚实标注数据质量；
+- 先保留可识别的失败证据，再增加复杂可靠性机制。
 
 ## 练习
 
-1. 为重试添加 Jitter（抖动）：在基础延迟上加入随机偏移，避免请求同时重试的"惊群效应"
-2. 将 Metrics 集成到 Agent.Run 中，自动记录每次运行的耗时和结果
-3. 在 Model Provider 中集成重试策略：当 API 返回 429 时自动重试
+1. 为一个只读 HTTP Tool 设计错误分类，并列出哪些状态码可重试、哪些不可重试。
+2. 为上述 Tool 加入带 full jitter 的有限重试，并写一个 Context 取消测试。
+3. 为“创建退款”设计幂等键，说明服务端需要保存什么状态。
+4. 运行一个总超时 3 秒、Provider 超时 10 秒的示例，验证较短的 Context 先终止。
+5. 用 `httptest.Server` 返回 429，验证 `HarnessError` 与 `HTTPError` 可以同时通过 `errors.As` 识别。

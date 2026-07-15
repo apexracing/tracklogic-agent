@@ -129,8 +129,14 @@ func TestRootHarnessTeamAndWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new harness: %v", err)
 	}
-	first := harness.NewAgent("first", "")
-	second := harness.NewAgent("second", "")
+	first, err := harness.CreateAgent("first", "")
+	if err != nil {
+		t.Fatalf("create first agent: %v", err)
+	}
+	second, err := harness.CreateAgent("second", "")
+	if err != nil {
+		t.Fatalf("create second agent: %v", err)
+	}
 
 	team := workflow.NewTeam(workflow.TeamConfig{
 		Name:   "test-team",
@@ -234,5 +240,33 @@ func TestRunContextUsesStandardContext(t *testing.T) {
 	got, ok := types.RunContextFrom(ctx)
 	if !ok || got != want {
 		t.Fatalf("run context = %#v, %v", got, ok)
+	}
+}
+
+func TestPermissionModesHaveExpectedDefaults(t *testing.T) {
+	tests := []struct {
+		name        string
+		mode        string
+		wantAllowed bool
+	}{
+		{name: "strict requires an explicit grant", mode: "strict", wantAllowed: false},
+		{name: "permissive grants built-in permissions", mode: "permissive", wantAllowed: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := agent.DefaultConfig()
+			cfg.DefaultModel.APIFormat = "mock"
+			cfg.PermissionMode = test.mode
+
+			harness, err := agent.New(cfg)
+			if err != nil {
+				t.Fatalf("new harness: %v", err)
+			}
+			err = harness.CheckPermission(security.PermWriteFile)
+			if gotAllowed := err == nil; gotAllowed != test.wantAllowed {
+				t.Fatalf("write permission allowed = %v, want %v (error: %v)", gotAllowed, test.wantAllowed, err)
+			}
+		})
 	}
 }

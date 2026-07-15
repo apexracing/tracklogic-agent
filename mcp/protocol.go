@@ -6,6 +6,11 @@ type JSONRPCVersion string
 
 const (
 	Version2 JSONRPCVersion = "2.0"
+
+	ProtocolVersion20250326 = "2025-03-26"
+	ProtocolVersion20250618 = "2025-06-18"
+	ProtocolVersion20251125 = "2025-11-25"
+	CurrentProtocolVersion  = ProtocolVersion20251125
 )
 
 type Request struct {
@@ -97,8 +102,10 @@ type CallToolParams struct {
 }
 
 type CallToolResult struct {
-	Content []ToolContent `json:"content"`
-	IsError bool          `json:"isError"`
+	Content           []ToolContent  `json:"content"`
+	StructuredContent any            `json:"structuredContent,omitempty"`
+	IsError           bool           `json:"isError"`
+	Meta              map[string]any `json:"_meta,omitempty"`
 }
 
 type ToolContent struct {

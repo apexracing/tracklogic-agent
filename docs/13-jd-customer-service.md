@@ -10,7 +10,7 @@
 4. **容错需求**：订单系统、物流系统可能不可用
 5. **编排复杂**：售后流程需要多步骤、有条件分支
 
-这个场景覆盖了 Harness 的**所有六大子系统**，是检验框架完整性的最佳案例。
+这个场景把 Engine、Tool、Memory、Model、Workflow、Security 和 Harness 门面组合起来。MCP、自动重试、持久化会话和生产级业务鉴权仍是扩展方向，不能因为 Demo 可运行就认为生产能力已经齐备。
 
 本章将前面 12 章的所有子系统组装为一个有业务价值的完整系统：京东智能客服。
 
@@ -85,11 +85,13 @@ flowchart TD
     RAW_RESULT --> USER_OUT
 ```
 
-### 13.1.3 安全要求
+### 13.1.3 安全要求与 Demo 边界
 
-- 手机号必须脱敏（138****8001）
-- 订单数据仅允许关联用户查看
-- 退款操作需二次确认
+- 手机号必须脱敏（138****8001）：Demo 已通过 `SanitizePII` 覆盖最终输入输出
+- 订单数据仅允许关联用户查看：**生产要求，Demo 尚无登录身份与归属校验**
+- 退款操作需二次确认：**生产要求，Demo 当前会直接创建内存中的退款记录**
+
+这里体现了一个重要设计原则：正则脱敏、工具权限和业务授权是不同安全层。框架级 Security 无法自动知道“这个订单是否属于当前用户”，领域规则必须在业务 Tool 中使用可信身份验证。
 
 ---
 
@@ -353,7 +355,7 @@ func (t *SendCouponTool) Execute(ctx context.Context, args map[string]any) (any,
 ### 分流 Agent
 
 ```go
-triageAgent := h.NewAgent("triage_agent",
+triageAgent, err := h.CreateAgentWithTools("triage_agent",
 	`你是京东智能客服的分流系统。
 你的职责是分析用户输入，判断用户意图。
 
@@ -367,26 +369,31 @@ triageAgent := h.NewAgent("triage_agent",
 - transfer_human: 用户要求转人工
 
 分析用户输入后，调用 classify_intent 工具返回分类结果。`,
+	"classify_intent",
 )
+if err != nil { return err }
 ```
 
 ### 订单 Agent
 
 ```go
-orderAgent := h.NewAgent("order_agent",
+orderAgent, err := h.CreateAgentWithTools("order_agent",
 	`你是京东智能客服的订单专员。
 你可以查询订单信息、物流状态。
 如果用户需要退款，转交给退款专员。
 如果用户不满，可以发放优惠券安抚。
 如果无法处理，转人工客服。
 请使用工具获取数据后，用中文友好回答。`,
+	"get_user_info", "query_order", "list_user_orders", "track_logistics",
+	"recommend_product", "transfer_human", "send_coupon",
 )
+if err != nil { return err }
 ```
 
 ### 退款 Agent
 
 ```go
-refundAgent := h.NewAgent("refund_agent",
+refundAgent, err := h.CreateAgentWithTools("refund_agent",
 	`你是京东智能客服的退款专员。
 你处理用户的退款、退货申请。
 注意：
@@ -395,7 +402,9 @@ refundAgent := h.NewAgent("refund_agent",
 - 创建退款后告知用户审核时间（1-3个工作日）
 如果用户不满，可以配合发优惠券安抚。
 无法处理的请转人工。`,
+	"get_user_info", "query_order", "create_refund", "transfer_human", "send_coupon",
 )
+if err != nil { return err }
 ```
 
 ---
@@ -403,7 +412,7 @@ refundAgent := h.NewAgent("refund_agent",
 ## 13.5 Agent 注册
 
 ```go
-func SetupAgents(h *harness.Harness) (*engine.Agent, *engine.Agent, *engine.Agent, error) {
+func SetupAgents(h *agent.Harness) (*engine.Agent, *engine.Agent, *engine.Agent, error) {
 	// 注册意图分类工具
 	if err := h.RegisterTool(NewIntentClassifierTool()); err != nil {
 		return nil, nil, nil, err
@@ -426,17 +435,31 @@ func SetupAgents(h *harness.Harness) (*engine.Agent, *engine.Agent, *engine.Agen
 	}
 
 	// 创建三个 Agent
-	triage := h.NewAgent("triage_agent", systemPromptTriage)
-	order  := h.NewAgent("order_agent",  systemPromptOrder)
-	refund := h.NewAgent("refund_agent", systemPromptRefund)
+	triage, err := h.CreateAgentWithTools("triage_agent", systemPromptTriage, "classify_intent")
+	if err != nil { return nil, nil, nil, err }
+	order, err := h.CreateAgentWithTools("order_agent", systemPromptOrder,
+		"get_user_info", "query_order", "list_user_orders", "track_logistics",
+		"recommend_product", "transfer_human", "send_coupon",
+	)
+	if err != nil { return nil, nil, nil, err }
+	refund, err := h.CreateAgentWithTools("refund_agent", systemPromptRefund,
+		"get_user_info", "query_order", "create_refund", "transfer_human", "send_coupon",
+	)
+	if err != nil { return nil, nil, nil, err }
 
 	return triage, order, refund, nil
 }
 ```
 
+这里使用 `CreateAgentWithTools`，同时解决两个问题：名称为空或重复时初始化立刻失败；每个 Agent 只看见职责需要的工具。所有 Agent 仍可共享并发安全 Registry，但 Registry 是能力目录，不代表每个 Agent 都拥有全部能力。白名单也在执行阶段复查，所以不能靠伪造 ToolCall 绕过。
+
 ---
 
 ## 13.6 Workflow 售后处理流程
+
+仓库提供两个 Workflow 示例。Demo 入口实际运行 `BuildCSWorkflow`：先执行 triage Step，再用 ConditionNode 路由到退款、转人工、问候或订单 Agent。`BuildAfterSalesWorkflow` 用于展示“验证 → 退款 → 条件补偿”的顺序控制流，并未在 `cmd/jd-cs-service/main.go` 中注册。
+
+`BuildCSWorkflow` 的 `AfterExecute` 最终还会根据原始输入调用确定性的 `classifyIntent` 更新 State。这样做是为了让无真实模型的 Mock Demo 也能稳定路由。代价是模型分类结果不是唯一事实来源；生产系统应明确选择模型分类、规则分类或二者仲裁，避免两套分类器静默冲突。
 
 ```go
 func BuildAfterSalesWorkflow(orderAgent, refundAgent *engine.Agent) *workflow.Workflow {
@@ -479,21 +502,15 @@ cfg.Security.SanitizePII = true          // 开启 PII 脱敏
 cfg.Security.EnableInjectionCheck = true  // 开启注入检测
 cfg.PermissionMode = "strict"             // 严格权限模式
 
-// PII 脱敏规则：先扩展默认实现，再注入 Harness
-sanitizer := security.NewSanitizer()
-sanitizer.AddRule(security.SanitizeRule{
-	Name:    "phone",
-	Pattern: regexp.MustCompile(`1[3-9]\d{9}`),
-	Replace: func(m string) string {
-		return m[:3] + "****" + m[7:]
-	},
-})
-h, err := agent.New(cfg, agent.WithSanitizer(sanitizer))
+// New 会根据 SecurityConfig 构造内置 Validator 与 Sanitizer。
+h, err := agent.New(cfg)
 if err != nil { return err }
 
-// 设置权限
+// strict 模式默认不授予受控权限；Demo 显式开放只读文件和网络。
 h.AllowPermissions(security.PermReadFile, security.PermNetAccess)
 ```
+
+Demo 的订单、退款等业务 Tool 当前没有接入领域权限映射，所以 `strict` 并不等于“订单权限已经完备”。真实系统应把登录用户身份放入可信 Context，在 `QueryOrderTool` / `CreateRefundTool` 中检查资源归属、角色、二次确认和幂等键。
 
 ### 安全集成流程图
 
@@ -527,7 +544,9 @@ flowchart LR
 
 ## 13.8 运行与测试
 
-### 模拟会话
+### 示例效果（说明性输出）
+
+下面展示真实模型和工具按预期协作时的理想效果，不是 Mock 模型的固定输出，也不是测试断言。实际文本、Token 和耗时会随模型与环境变化；无 API Key 时 Demo 回退到 Mock，重点验证组装和路由，不会生成同等自然语言效果。
 
 ```
 ═══════════════════════════════════════
@@ -580,9 +599,9 @@ flowchart LR
 | 06 | 模型集成 | 调用 LLM 理解自然语言 |
 | 07 | 输出治理 | 手机号脱敏、注入检测 |
 | 08 | 编排引擎 | 售后处理 Workflow |
-| 09 | MCP 协议 | 对接外部物流系统 |
-| 10 | 生产化 | JSON 配置、slog 日志 |
-| 11 | 容错 | API 调用重试 |
+| 09 | MCP 协议 | 可用于未来对接外部物流系统；当前 Demo 使用内存 Tool |
+| 10 | 生产化 | JSON 配置、可注入的 slog 日志 |
+| 11 | 容错 | 当前使用超时、Context 与循环上限；自动重试待扩展 |
 | 12 | 安全 | 权限、脱敏、校验 |
 
 ---
@@ -592,8 +611,8 @@ flowchart LR
 1. **AgentOS Server** — 添加 Gin HTTP 服务，将 Agent 暴露为 REST API
 2. **长期记忆** — 接入 PostgreSQL/MongoDB 持久化会话历史
 3. **RAG 知识库** — 接入 ChromaDB，回答产品知识问题
-4. **多轮对话** — 实现连续对话（目前每次 RunAgent 是独立的）
-5. **监控告警** — Prometheus 指标 + Grafana 面板
+4. **多会话隔离** — 同一 Agent 的多次 Run 会共享 Memory；增加 Session → Memory/Agent 路由，避免不同用户串线
+5. **运行排错** — 在应用入口集中记录 RunID、结构化错误和必要的安全日志
 6. **A/B 测试** — 同时在两个模型上运行，对比效果
 
 ---

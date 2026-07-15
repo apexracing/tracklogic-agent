@@ -21,6 +21,7 @@ type OpenAIProvider struct {
 	baseURL    string
 	modelID    string
 	httpClient *http.Client
+	headers    http.Header
 	logger     *slog.Logger
 }
 
@@ -29,6 +30,11 @@ type OpenAIConfig struct {
 	BaseURL string
 	ModelID string
 	Timeout time.Duration
+	Logger  *slog.Logger
+	// HTTPClient is cloned before use. If its Timeout is zero, Timeout above is
+	// applied to the clone. Headers can override default request headers.
+	HTTPClient *http.Client
+	Headers    http.Header
 }
 
 func NewOpenAI(cfg OpenAIConfig) *OpenAIProvider {
@@ -38,15 +44,20 @@ func NewOpenAI(cfg OpenAIConfig) *OpenAIProvider {
 	if cfg.ModelID == "" {
 		cfg.ModelID = "gpt-4o-mini"
 	}
-	if cfg.Timeout == 0 {
+	if cfg.Timeout <= 0 {
 		cfg.Timeout = 60 * time.Second
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
 	}
 	return &OpenAIProvider{
 		apiKey:     cfg.APIKey,
 		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
 		modelID:    cfg.ModelID,
-		httpClient: &http.Client{Timeout: cfg.Timeout},
-		logger:     slog.With("component", "model", "provider", "openai", "model_id", cfg.ModelID),
+		httpClient: configuredHTTPClient(cfg.HTTPClient, cfg.Timeout),
+		headers:    cfg.Headers.Clone(),
+		logger:     logger.With("component", "model", "provider", "openai", "model_id", cfg.ModelID),
 	}
 }
 
@@ -109,6 +120,9 @@ type responsesStreamEvent struct {
 }
 
 func (p *OpenAIProvider) Invoke(ctx context.Context, req *InvokeRequest) (*InvokeResponse, error) {
+	if err := validateInvokeRequest(req); err != nil {
+		return nil, err
+	}
 	apiReq, err := p.buildRequest(req, false)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
@@ -127,29 +141,30 @@ func (p *OpenAIProvider) Invoke(ctx context.Context, req *InvokeRequest) (*Invok
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	applyCustomHeaders(httpReq, p.headers)
 
 	resp, err := p.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, types.WrapError(types.ErrAPIError, "http request failed", err)
+		return nil, modelTransportError(err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, types.WrapError(types.ErrAPIError,
-			fmt.Sprintf("API returned status %d", resp.StatusCode),
-			fmt.Errorf("%s", string(respBody)))
+		return nil, modelHTTPError(p.Provider(), resp)
 	}
 
 	var apiResp responsesAPIResponse
-	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+	if err := decodeModelJSON(resp.Body, &apiResp); err != nil {
+		return nil, err
 	}
 
 	return parseResponsesOutput(&apiResp), nil
 }
 
 func (p *OpenAIProvider) InvokeStream(ctx context.Context, req *InvokeRequest) (<-chan ResponseChunk, error) {
+	if err := validateInvokeRequest(req); err != nil {
+		return nil, err
+	}
 	apiReq, err := p.buildRequest(req, true)
 	if err != nil {
 		return nil, err
@@ -166,10 +181,11 @@ func (p *OpenAIProvider) InvokeStream(ctx context.Context, req *InvokeRequest) (
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	applyCustomHeaders(httpReq, p.headers)
 
 	resp, err := p.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, err
+		return nil, modelTransportError(err)
 	}
 
 	ch := make(chan ResponseChunk, 64)
@@ -178,10 +194,7 @@ func (p *OpenAIProvider) InvokeStream(ctx context.Context, req *InvokeRequest) (
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			respBody, _ := io.ReadAll(resp.Body)
-			ch <- ResponseChunk{Error: types.WrapError(types.ErrAPIError,
-				fmt.Sprintf("API returned status %d", resp.StatusCode),
-				fmt.Errorf("%s", string(respBody)))}
+			emitResponseChunk(ctx, ch, ResponseChunk{Error: modelHTTPError(p.Provider(), resp)})
 			return
 		}
 
@@ -195,27 +208,31 @@ func (p *OpenAIProvider) InvokeStream(ctx context.Context, req *InvokeRequest) (
 			}
 			data := strings.TrimPrefix(line, "data: ")
 			if data == "[DONE]" {
-				ch <- ResponseChunk{Done: true}
+				emitResponseChunk(ctx, ch, ResponseChunk{Done: true})
 				return
 			}
 
 			var evt responsesStreamEvent
 			if err := json.Unmarshal([]byte(data), &evt); err != nil {
-				continue
+				emitResponseChunk(ctx, ch, ResponseChunk{Error: modelStreamError("decode responses stream event", err)})
+				return
 			}
 
 			switch evt.Type {
 			case "response.output_text.delta":
 				if evt.Delta != "" {
-					ch <- ResponseChunk{Content: evt.Delta}
+					if !emitResponseChunk(ctx, ch, ResponseChunk{Content: evt.Delta}) {
+						return
+					}
 				}
 			case "response.output_item.done":
 				var item responsesOutItem
 				if err := json.Unmarshal(evt.Item, &item); err != nil {
-					continue
+					emitResponseChunk(ctx, ch, ResponseChunk{Error: modelStreamError("decode responses tool event", err)})
+					return
 				}
 				if item.Type == "function_call" {
-					ch <- ResponseChunk{
+					if !emitResponseChunk(ctx, ch, ResponseChunk{
 						ToolCall: &types.ToolCall{
 							ID:   item.CallID,
 							Type: "function",
@@ -224,6 +241,8 @@ func (p *OpenAIProvider) InvokeStream(ctx context.Context, req *InvokeRequest) (
 								Arguments: item.Arguments,
 							},
 						},
+					}) {
+						return
 					}
 				}
 			case "response.completed":
@@ -232,7 +251,7 @@ func (p *OpenAIProvider) InvokeStream(ctx context.Context, req *InvokeRequest) (
 				}
 				if err := json.Unmarshal([]byte(data), &completed); err == nil && completed.Response.Usage != nil {
 					u := completed.Response.Usage
-					ch <- ResponseChunk{
+					emitResponseChunk(ctx, ch, ResponseChunk{
 						Done:         true,
 						FinishReason: "stop",
 						Usage: &types.Usage{
@@ -240,20 +259,22 @@ func (p *OpenAIProvider) InvokeStream(ctx context.Context, req *InvokeRequest) (
 							CompletionTokens: u.OutputTokens,
 							TotalTokens:      u.TotalTokens,
 						},
-					}
+					})
 				} else {
-					ch <- ResponseChunk{Done: true, FinishReason: "stop"}
+					emitResponseChunk(ctx, ch, ResponseChunk{Done: true, FinishReason: "stop"})
 				}
 				return
 			case "error":
-				ch <- ResponseChunk{Error: fmt.Errorf("stream error: %s", data), Done: true}
+				emitResponseChunk(ctx, ch, ResponseChunk{Error: modelStreamError("responses stream returned an error", fmt.Errorf("%s", data)), Done: true})
 				return
 			}
 		}
 
 		if err := scanner.Err(); err != nil {
-			ch <- ResponseChunk{Error: err}
+			emitResponseChunk(ctx, ch, ResponseChunk{Error: modelStreamError("read responses stream", err)})
+			return
 		}
+		emitResponseChunk(ctx, ch, ResponseChunk{Error: modelStreamError("responses stream ended before completion", io.EOF)})
 	}()
 
 	return ch, nil
@@ -272,10 +293,7 @@ func (p *OpenAIProvider) buildRequest(req *InvokeRequest, stream bool) (*respons
 	}
 
 	for _, td := range req.Tools {
-		params := map[string]any{
-			"type":       td.Parameters.Type,
-			"properties": td.Parameters.Properties,
-		}
+		params := td.Parameters.Schema()
 		if len(td.Parameters.Required) > 0 {
 			params["required"] = td.Parameters.Required
 		}

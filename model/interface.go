@@ -48,6 +48,29 @@ type ToolParameters struct {
 	Type       string                   `json:"type"`
 	Properties map[string]ToolParameter `json:"properties"`
 	Required   []string                 `json:"required,omitempty"`
+	// RawSchema preserves arbitrary JSON Schema keywords discovered through
+	// MCP (for example items, oneOf, $defs, and nested object constraints).
+	// When set, Schema returns this map unchanged except for a shallow copy.
+	RawSchema map[string]any `json:"-"`
+}
+
+// Schema returns the JSON Schema representation used by model providers.
+func (parameters ToolParameters) Schema() map[string]any {
+	if parameters.RawSchema != nil {
+		result := make(map[string]any, len(parameters.RawSchema))
+		for key, value := range parameters.RawSchema {
+			result[key] = value
+		}
+		return result
+	}
+	result := map[string]any{
+		"type":       parameters.Type,
+		"properties": parameters.Properties,
+	}
+	if len(parameters.Required) > 0 {
+		result["required"] = parameters.Required
+	}
+	return result
 }
 
 type ToolParameter struct {

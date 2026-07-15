@@ -2,6 +2,10 @@
 
 ### 设计思路：为什么大模型的输出需要"治理"？
 
+治理的关键不是“再让模型检查一次”，而是把能确定判断的规则放进代码边界。长度、危险字符串、权限和 PII 模式都应由确定性组件处理；模型审核只能作为补充信号。
+
+> 当前边界：自动治理发生在 `Harness.RunAgent`、`RunTeam` 和 `RunWorkflow`。直接调用 `engine.Agent.Run` 会绕过 façade，调用方必须自行承担输入输出治理。
+
 大模型的输出天然不可控——它可能包含幻觉、格式错误、敏感数据。输出治理层就是这些问题的"守门员"。
 
 ```mermaid
@@ -146,11 +150,15 @@ func (v *DefaultOutputValidator) Validate(output string) error {
 
 输出长度校验虽然简单，但很实用——防止 Agent 生成海量内容耗尽内存。
 
+当前长度判断使用 Go 的 `len(string)`，单位实际是 UTF-8 **字节数**，不是 Unicode 字符数；中文通常占多个字节。配置阈值应按字节理解。如果产品要求“最多 N 个用户可见字符”，应改用 rune 计数并补充测试。
+
 ---
 
 ## 7.4 PII 脱敏
 
 PII（Personally Identifiable Information）泄露是生产环境中最常见的安全问题。Agent 在对话中可能无意中泄露用户的手机号、身份证号等信息。
+
+正则脱敏是格式识别，不是完整的数据防泄漏系统。它可能漏掉带国家区号、空格变体或自然语言地址，也可能误伤普通数字。高风险场景还需要结构化字段分级、日志脱敏、访问控制和审计。
 
 ### 7.4.1 Sanitizer 设计
 
@@ -285,6 +293,8 @@ func (h *Harness) RunAgent(ctx context.Context, name, input string) *RunOutput {
 	return output
 }
 ```
+
+以上片段省略了 Agent 查找和具体错误结构，用于展示治理顺序。`Sanitize` 仅在 `Security.SanitizePII` 为 true 时修改文本；注入检测同样受 `EnableInjectionCheck` 控制。默认配置关闭这两个开关，示例配置会开启。
 
 ---
 

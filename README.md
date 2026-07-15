@@ -2,6 +2,8 @@
 
 `tracklogic-agent` 是一个用于构建模型驱动 Agent、工具调用、记忆、Team 和 Workflow 的纯 Go 公共库。根包 `agent` 提供 Harness 与配置入口；`engine`、`model`、`memory`、`tool`、`security`、`types`、`workflow` 和 `mcp` 是职责独立的公共扩展包。
 
+本库只负责通用 Harness。领域数据接入、分析逻辑、结论与报告属于依赖本库的应用，通过自定义 Tool、MCP、Model 或 Workflow 组合实现，不在核心包中定义领域类型。
+
 项目同时包含《智能体 Harness 工程指南》的 13 章教程和一个可运行的 JD 智能客服示例。
 
 ## 环境与安装
@@ -39,7 +41,10 @@ func main() {
     }
     defer harness.Close()
 
-    assistant := harness.NewAgent("assistant", "你是一个简洁、可靠的助手。")
+    assistant, err := harness.CreateAgent("assistant", "你是一个简洁、可靠的助手。")
+    if err != nil {
+        log.Fatal(err)
+    }
     result := assistant.Run(context.Background(), "你好",
         engine.WithMaxLoops(5),
         engine.WithTemperature(0.2),
@@ -91,6 +96,16 @@ runtimeAgent := engine.NewAgent(engine.AgentConfig{
 
 `base_url`、`api_key` 和 `model_id` 均由调用方显式配置，不会根据 `vendor` 推断。
 
+`agent.New` 会自动归一化并校验配置。需要统一应用日志时，使用 `agent.WithLogger` 注入运行时依赖；库不会替换进程的 `slog.Default`。
+
+生产代码建议使用返回 error 的 `CreateAgent`、`CreateTeam` 和 `CreateWorkflow`，避免非法名称或同名注册被忽略。多个 Agent 共用 Registry 时，使用 `CreateAgentWithTools` 声明每个 Agent 的最小工具集合；白名单同时限制模型可见定义和实际执行。同一个有状态 Agent 的 Run 会串行执行，等待期间可被 Context 取消；不同会话应使用不同 Agent/Memory，才能并行且隔离上下文。
+
+Model Provider 对普通响应设置 16 MiB 上限，对错误响应设置 8 KiB 上限；429、超时和取消会保留可识别错误码。`RunOutput`、`TeamOutput` 和 `WorkflowResult` 的 `Err` 可用于 `errors.As`，字符串 `Error` 用于兼容序列化。需要企业代理、mTLS、自定义 Header 或应用层重试时，可预构造 Model 并通过 `agent.WithModel` 注入。
+
+MCP Client 支持 Streamable HTTP、协议协商、Session、JSON/SSE 响应和完整 JSON Schema 保留。含认证 Header、mTLS 或代理的 Client 应通过 `mcp.NewClient(...)` 预构造，再用 `agent.WithMCPClient` 注入；远端工具仍需显式调用 `InitMCPClients` 才会注册。
+
+内置文件工具使用 Go 的受限目录根 API，拒绝 `..` 和越界符号链接，并限制单文件为 1 MiB；`http_get` 默认拒绝私网、回环和链路本地地址，限制重定向、超时和正文大小。需要访问内网服务时应显式构造带策略的 Tool，而不是放宽整个 Harness。
+
 ## JD 智能客服示例
 
 示例固定读取仓库根目录下的 `examples/config.example.json`。配置不保存 API Key；Key 为空时自动回退到 Mock 模型。
@@ -125,7 +140,7 @@ docs/                             13 章 Harness 教程
 
 ## 教程与测试
 
-教程入口为 [docs/01-introduction.md](docs/01-introduction.md)。
+建议先阅读 [学习路线与设计决策总览](docs/00-learning-guide.md)，建立“概率模型 + 确定性 Harness”的整体心智模型，再从 [第 1 章](docs/01-introduction.md) 开始按章学习。
 
 ```bash
 go test ./...

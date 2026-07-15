@@ -25,6 +25,9 @@ func (m *MockModel) Provider() string { return "mock" }
 func (m *MockModel) ModelID() string  { return m.modelID }
 
 func (m *MockModel) Invoke(ctx context.Context, req *InvokeRequest) (*InvokeResponse, error) {
+	if err := validateInvokeRequest(req); err != nil {
+		return nil, err
+	}
 	select {
 	case <-ctx.Done():
 		return nil, types.WrapError(types.ErrRunCancelled, "context cancelled", ctx.Err())
@@ -40,6 +43,9 @@ func (m *MockModel) Invoke(ctx context.Context, req *InvokeRequest) (*InvokeResp
 }
 
 func (m *MockModel) InvokeStream(ctx context.Context, req *InvokeRequest) (<-chan ResponseChunk, error) {
+	if err := validateInvokeRequest(req); err != nil {
+		return nil, err
+	}
 	resp, err := m.Invoke(ctx, req)
 	if err != nil {
 		return nil, err

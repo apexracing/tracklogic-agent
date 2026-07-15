@@ -72,7 +72,8 @@ type Tool interface {
 - 包含参数 Schema，模型据此生成参数
 
 **Validate()**
-- 校验参数是否存在、类型是否正确
+- `BaseTool.Validate` 校验必填字段、JSON 基本类型、有限数值、整数语义和字符串 Enum
+- 数值范围、字段间关系、资源归属等领域规则由具体 Tool 继续校验；Definition 中的 Schema 是给模型的约束提示，不能替代执行端校验
 - 在校验通过后才执行，避免无效调用
 
 **Execute()**
@@ -84,6 +85,8 @@ type Tool interface {
 ## 4.3 BaseTool 基类
 
 为了避免每个工具都重复实现 `Name()`、`Description()`、`Definition()` 等通用方法，我们提供一个 `BaseTool` 结构体。
+
+这里选择“嵌入小型基类”而不是反射自动生成 Tool，是为了让公开 Schema 保持显式、容易审查。代价是复杂参数校验仍要在具体 Tool 中编写；这恰好把通用的类型/必填/Enum 校验与领域规则分开。
 
 ```go
 type BaseTool struct {
@@ -124,7 +127,8 @@ func (b BaseTool) Definition() model.ToolDefinition {
 	}
 }
 
-// Validate 检查必需参数是否存在
+// 教学简化：真实实现还会按 Type 检查 string/number/integer/
+// boolean/object/array，并检查字符串 Enum。
 func (b BaseTool) Validate(args map[string]any) error {
 	for _, p := range b.parameters {
 		if p.Required {
@@ -190,6 +194,7 @@ flowchart LR
 - 注册阶段是一次性的，执行阶段是循环的
 - Registry 解耦了工具的创建和使用
 - Validate 和 Execute 分离，确保不执行非法参数
+- 多 Agent 共用 Registry 时，用 Agent 工具白名单同时约束“模型可见”和“程序可执行”
 
 ---
 
@@ -224,6 +229,8 @@ func NewRegistry() *Registry {
 }
 
 func (r *Registry) Register(t Tool) error {
+	// 真实实现先拒绝 nil/typed-nil、空名称，并确认
+	// t.Definition().Name 与 t.Name() 一致。
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	name := t.Name()
@@ -250,10 +257,9 @@ func (r *Registry) Get(name string) (Tool, bool) {
 func (r *Registry) List() []Tool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	result := make([]Tool, 0, len(r.tools))
-	for _, t := range r.tools {
-		result = append(result, t)
-	}
+	// 真实实现先排序名称，再按名称取 Tool，避免 map 随机顺序
+	// 改变每次发送给 Model 的工具列表。
+	result := toolsSortedByName(r.tools) // 教学简写
 	return result
 }
 ```
@@ -266,9 +272,11 @@ Registry 是**读多写少**的典型场景：
 
 `RWMutex` 允许多个读操作同时进行，只在写操作时互斥，性能优于 `sync.Mutex`。
 
+Registry 是能力目录，不等于每个 Agent 的授权集合。根 Harness 的 `CreateAgentWithTools(name, prompt, names...)` 会先确认名称已注册且无重复，再构造受限 Agent。Agent 发给 Model 的定义只包含白名单；即使自定义 Model 伪造白名单外的 ToolCall，执行阶段也会返回 `SECURITY_VIOLATION`。这种“双检查”避免把安全完全寄托在 Prompt 或模型行为上。
+
 ### 为什么 Register 返回 error 而非 panic？
 
-工具名冲突通常是配置错误。在 Harness 初始化时注册工具，即使某个工具重复注册，也不应该让整个系统崩溃。返回 error 让上层处理。
+工具名冲突或 Definition 不一致通常是配置错误。在 Harness 初始化时注册工具，不应该让整个系统 panic。返回 error 让上层在接受流量前失败。`MustRegister` 只适合测试或编译期固定集合。
 
 ---
 
@@ -374,41 +382,20 @@ func NewReadFile(allowedDir string) *ReadFileTool {
 
 func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) (any, error) {
 	path, _ := args["path"].(string)
-
-	// 安全校验：防止路径遍历攻击
-	fullPath, err := t.safePath(path)
+	root, err := os.OpenRoot(t.allowedDir)
 	if err != nil {
 		return nil, err
 	}
-
-	data, err := os.ReadFile(fullPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
-	}
-
-	return string(data), nil
+	defer root.Close()
+	file, err := root.Open(path)
+	// 真实实现使用 LimitReader，单文件最多读取 1 MiB。
+	return readAtMost1MiB(file, err) // 教学简写
 }
 ```
 
-**路径遍历防护**：
+**为什么不能只检查 `..`？**
 
-```go
-func (t *ReadFileTool) safePath(path string) (string, error) {
-	fullPath := filepath.Join(t.allowedDir, path)
-	absPath, _ := filepath.Abs(fullPath)
-	absAllowed, _ := filepath.Abs(t.allowedDir)
-
-	rel, err := filepath.Rel(absAllowed, absPath)
-	if err != nil || strings.HasPrefix(rel, "..") {
-		return "", fmt.Errorf("path traversal detected: %q is outside allowed directory", path)
-	}
-	return absPath, nil
-}
-```
-
-**为什么需要 `safePath`？**
-
-如果没有此防护，Agent 可能通过 `../../etc/passwd` 读取系统敏感文件。`safePath` 通过计算相对路径并检查是否以 `..` 开头来防止此攻击。
+词法路径检查可以挡住 `../../outside`，却挡不住“允许目录中的符号链接指向目录外”。当前实现使用 Go 1.26 的 `os.OpenRoot`：所有打开、创建父目录和读写操作都相对于目录根完成；越界 `..`、绝对链接和指向根外的符号链接会被标准库拒绝。Read/Write 单文件限制为 1 MiB，ListDir 最多返回 1000 项，避免工具结果耗尽内存或上下文。
 
 ### 4.6.3 其他常用内置工具
 
@@ -418,10 +405,10 @@ func (t *ReadFileTool) safePath(path string) (string, error) {
 |--------|------|----------|------|
 | `get_current_time` | 获取当前时间（可选 IANA 时区） | `timezone` | 无 |
 | `list_dir` | 列出目录条目（同文件沙箱） | `path` | `read_file` |
-| `http_get` | HTTP GET，默认 10s 超时，正文上限 64KiB | `url`, `timeout_seconds` | `network_access` |
+| `http_get` | 有界 HTTP(S) GET；默认拒绝私网，最多 5 次重定向 | `url`, `timeout_seconds` | `network_access` |
 | `json_parse` | 将 JSON 字符串解析为结构化值 | `text` | 无 |
 
-`list_dir` 与 `read_file` / `write_file` 共用路径穿越防护。`http_get` 在非 2xx 时仍返回 `status` + 截断后的 `body`，由 Agent 自行判断是否重试。
+`list_dir` 与 `read_file` / `write_file` 共用安全目录根。`http_get` 默认超时 10 秒、策略上限 30 秒、正文上限 64 KiB；默认拒绝回环、私网、链路本地、组播、未指定地址和 CGNAT，并在每次重定向时重新检查 Host。需要访问可信内网时，应显式使用 `NewHTTPGetWithConfig` 配置 allowlist/网络策略，而不是修改全局默认。非 2xx 仍返回 `status` + 截断后的 `body`，由业务决定含义。
 
 ### 工具类图
 
@@ -453,13 +440,11 @@ classDiagram
     class ReadFileTool {
         -allowedDir: string
         +Execute(ctx, args) (any, error)
-        -safePath(path) (string, error)
     }
     
     class WriteFileTool {
         -allowedDir: string
         +Execute(ctx, args) (any, error)
-        -safePath(path) (string, error)
     }
     
     class Registry {
@@ -510,8 +495,9 @@ Agent.Run()
 | 错误类型 | 处理方式 |
 |---------|---------|
 | 参数缺失 | 在 Validate 阶段返回，不执行 |
-| 参数类型错误 | 同上 |
-| 外部系统不可用 | 执行时返回错误，Agent 决定是否重试 |
+| 参数基本类型/Enum 错误 | BaseTool.Validate 返回，不执行 |
+| 参数范围/领域关系错误 | 具体 Tool 的 Validate 或 Execute 返回错误 |
+| 外部系统不可用 | Execute 返回错误；Agent 将错误写回模型，由下一轮决定解释或换方案 |
 | 结果过大 | 可能需要截断（避免超过 Token 限制） |
 | 权限不足 | 在安全层拦截，不执行 |
 
@@ -523,12 +509,12 @@ Agent.Run()
 - 实现了 `BaseTool` 基类，减少重复代码
 - 实现了线程安全的 `Registry` 工具注册中心
 - 实现了计算器、文件操作、时间、列目录、HTTP GET、JSON 解析等内置工具
-- 建立了路径遍历防护等安全机制
+- 建立了目录根、符号链接越界防护、结果上限和 HTTP SSRF 默认防护
 
 ---
 
 ## 练习
 
-1. 为 `http_get` 增加域名 allowlist，并把响应截断上限做成可配置
+1. 为 `http_get` 编写 DNS 返回“一个公网地址 + 一个私网地址”的测试，解释为什么应整体拒绝
 2. 为 Registry 添加 `ListByPermission(perm string) []Tool` 方法，方便权限控制
 3. 实现工具结果截断机制：当工具返回超过 2000 字符时，自动截断并添加 `[truncated]` 标记

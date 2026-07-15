@@ -2,8 +2,10 @@ package builtin
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,8 +65,46 @@ func TestListDir_Traversal(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected traversal error")
 	}
-	if !strings.Contains(err.Error(), "path traversal") {
+	if !strings.Contains(err.Error(), "securely open") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestFileToolsRejectSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(outsideFile, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, filepath.Join(root, "secret-link")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	if _, err := NewReadFile(root).Execute(context.Background(), map[string]any{"path": "secret-link"}); err == nil {
+		t.Fatal("ReadFile followed a symlink outside the allowed root")
+	}
+
+	if err := os.Symlink(outside, filepath.Join(root, "outside-dir")); err != nil {
+		t.Skipf("directory symlink unavailable: %v", err)
+	}
+	if _, err := NewWriteFile(root).Execute(context.Background(), map[string]any{
+		"path": "outside-dir/created.txt", "content": "escaped",
+	}); err == nil {
+		t.Fatal("WriteFile followed a symlink outside the allowed root")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "created.txt")); !os.IsNotExist(err) {
+		t.Fatalf("outside file exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+func TestReadFileRejectsOversizedContent(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "large.txt"), []byte(strings.Repeat("x", maxFileContentBytes+1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewReadFile(root).Execute(context.Background(), map[string]any{"path": "large.txt"}); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("ReadFile error = %v, want size limit", err)
 	}
 }
 
@@ -76,7 +116,7 @@ func TestHTTPGet(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tool := NewHTTPGet()
+	tool := NewHTTPGetWithConfig(HTTPGetConfig{AllowPrivateNetworks: true})
 	out, err := tool.Execute(context.Background(), map[string]any{"url": srv.URL})
 	if err != nil {
 		t.Fatal(err)
@@ -97,7 +137,7 @@ func TestHTTPGet_Truncate(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tool := NewHTTPGet()
+	tool := NewHTTPGetWithConfig(HTTPGetConfig{AllowPrivateNetworks: true})
 	out, err := tool.Execute(context.Background(), map[string]any{"url": srv.URL})
 	if err != nil {
 		t.Fatal(err)
@@ -109,6 +149,40 @@ func TestHTTPGet_Truncate(t *testing.T) {
 	body := m["body"].(string)
 	if len(body) != maxHTTPBodyBytes {
 		t.Errorf("body len = %d", len(body))
+	}
+}
+
+func TestHTTPGetBlocksPrivateNetworksByDefault(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte("should not be reached"))
+	}))
+	defer server.Close()
+
+	_, err := NewHTTPGet().Execute(context.Background(), map[string]any{"url": server.URL})
+	if err == nil || !strings.Contains(err.Error(), "disallowed address") {
+		t.Fatalf("HTTPGet error = %v, want private-network rejection", err)
+	}
+}
+
+func TestHTTPGetRevalidatesRedirectHost(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		host, port, _ := net.SplitHostPort(request.Host)
+		_ = host
+		http.Redirect(writer, request, "http://localhost:"+port+"/redirected", http.StatusFound)
+	}))
+	defer server.Close()
+
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeTool := NewHTTPGetWithConfig(HTTPGetConfig{
+		AllowPrivateNetworks: true,
+		AllowedHosts:         []string{parsed.Hostname()},
+	})
+	_, err = runtimeTool.Execute(context.Background(), map[string]any{"url": server.URL})
+	if err == nil || !strings.Contains(err.Error(), "redirect rejected") {
+		t.Fatalf("HTTPGet redirect error = %v", err)
 	}
 }
 

@@ -68,10 +68,12 @@ Layer 4: 输出安全层
 
 ```
 Guest → User → Admin
-只读     读写      执行 + 网络
+读文件   文件读写 + 网络 + 读库   全部内置权限
 ```
 
-Harness 的默认策略是**最小权限**（Principle of Least Privilege）——初始状态所有权限都被拒绝，只有明确允许的才能使用。
+`ListPermissionManager` 本身采用**默认拒绝**。Harness 的 `strict` 模式保留这个状态，只有 `AllowPermissions` 明确开放的受控动作才能执行；默认的 `permissive` 模式会预授予 `RoleAdmin` 的内置权限，便于本地开发。生产环境应显式选择 `strict`。
+
+还要区分两层开关：`allowed_tools` 决定 Tool 是否进入 Registry；PermissionManager 决定已注册 Tool 在运行时能否执行。只配置其中一层都不完整。
 
 ---
 
@@ -157,7 +159,7 @@ const (
 )
 
 var roleDefaults = map[Role][]Permission{
-	RoleAdmin: {PermReadFile, PermWriteFile, PermExec, PermNetAccess, PermReadDB, PermWriteDB},
+	RoleAdmin: {PermReadFile, PermWriteFile, PermExec, PermNetAccess, PermReadDB, PermWriteDB, PermSendEmail},
 	RoleUser:  {PermReadFile, PermWriteFile, PermNetAccess, PermReadDB},
 	RoleGuest: {PermReadFile},
 }
@@ -174,6 +176,12 @@ func (pm *ListPermissionManager) SetRole(role Role) {
 	}
 }
 ```
+
+Role 是一组权限的启动模板，`SetRole` 会重置已有 allow/deny 列表。需要例外规则时应先设置 Role，再调用 `Allow` 或 `Deny`。
+
+当前 `RequiredPermission` 只映射文件、HTTP 内置工具和 `mcp_` 前缀工具。自定义高风险 Tool 不会自动获得权限映射；生产扩展应注入自己的 PermissionManager/策略映射，或在 Tool 内执行领域鉴权。Prompt 中写“不要越权”不能替代代码检查。
+
+多 Agent 系统还应先缩小能力可见面：`CreateAgentWithTools` 让每个 Agent 只看见并执行自己的工具集合，PermissionManager 再判断本次调用者是否有权执行。两者解决的问题不同：Agent 工具白名单回答“这个角色是否拥有这项能力”，权限策略回答“这次请求是否被允许”。
 
 ---
 
@@ -201,62 +209,99 @@ var injectionPatterns = []*regexp.Regexp{
 
 ## 12.4 路径遍历防护
 
-文件操作工具必须防止 Agent 通过 `../../` 逃逸到沙箱目录之外：
+文件操作工具必须防止模型通过 `../../` 或目录内的符号链接逃逸到允许目录之外。只做 `filepath.Abs` + `filepath.Rel` 的字符串检查是不够的：路径在检查时可能位于根目录内，但操作系统解析其中的符号链接后却指向根目录外；检查和打开分成两步还会产生竞态窗口。
+
+当前 `read_file`、`write_file` 和 `list_dir` 每次执行都使用 Go 的 `os.OpenRoot` 打开受限目录，并通过 Root 相对路径 API 完成真正的文件操作：
 
 ```go
 func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) (any, error) {
 	path, _ := args["path"].(string)
-	fullPath, err := t.resolvePath(path)
+	if path == "" { return nil, fmt.Errorf("path is required") }
+
+	root, err := os.OpenRoot(t.allowedDir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open allowed directory: %w", err)
 	}
-	data, _ := os.ReadFile(fullPath)
+	defer root.Close()
+
+	file, err := root.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("securely open file %q: %w", path, err)
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, (1<<20)+1))
+	if err != nil { return nil, err }
+	if len(data) > 1<<20 {
+		return nil, fmt.Errorf("file exceeds 1 MiB")
+	}
 	return string(data), nil
-}
-
-func (t *ReadFileTool) resolvePath(path string) (string, error) {
-	// 如果未设置 allowedDir，使用绝对路径
-	if t.allowedDir == "" {
-		return filepath.Abs(path)
-	}
-
-	fullPath := filepath.Join(t.allowedDir, path)
-	absPath, _ := filepath.Abs(fullPath)
-	absAllowed, _ := filepath.Abs(t.allowedDir)
-
-	// 计算相对路径，检查是否以 .. 开头
-	rel, err := filepath.Rel(absAllowed, absPath)
-	if err != nil {
-		return "", fmt.Errorf("path resolution error: %w", err)
-	}
-	if strings.HasPrefix(rel, "..") {
-		return "", fmt.Errorf("path traversal detected: %q is outside allowed directory", path)
-	}
-
-	return absPath, nil
 }
 ```
 
+三个工具还有资源上限：单个读写文件最多 1 MiB，目录最多返回 1000 个条目并用 `truncated` 标记截断。`allowedDir == ""` 会归一化为当前目录 `.`，不会变成“允许任意绝对路径”。
+
+设计思路是把安全约束放到“实际打开文件”的系统调用边界，而不是依赖一次容易失效的路径字符串判断。测试也覆盖普通 `..` 逃逸和根目录内符号链接指向外部文件两种情况。
+
 ---
 
-## 12.5 集成到 Harness
+## 12.5 HTTP 工具的 SSRF 防护
+
+通用 HTTP Tool 接收模型生成的 URL，因此必须假设 URL、DNS 和重定向都不可信。若直接调用默认 `http.Client`，模型可能访问进程所在机器的回环地址、云环境元数据地址或内网管理接口。
+
+`http_get` 的默认策略是：
+
+- 只允许 HTTP(S)，拒绝带 `user:password@host` 的 URL；
+- 默认拒绝私网、回环、链路本地、组播、未指定地址和 CGNAT；
+- DNS 返回多个地址时，只要其中一个不允许就拒绝预检；真正拨号时再次筛选地址，降低 DNS 重绑定风险；
+- 每次重定向都重新校验目标，最多 5 次；
+- 默认请求超时 10 秒，策略上限 30 秒；正文默认最多 64 KiB，并返回 `truncated`；
+- 可用精确 Host 或 `*.example.com` allowlist 进一步缩小范围。
+
+需要访问可信内网时必须显式配置，而不是修改全局默认：
+
+```go
+internalFetch := builtin.NewHTTPGetWithConfig(builtin.HTTPGetConfig{
+	AllowedHosts:         []string{"api.internal.example"},
+	AllowPrivateNetworks: true,
+	MaxTimeout:           5 * time.Second,
+	MaxBodyBytes:         32 << 10,
+})
+```
+
+注入自定义 `HTTPClient` 代表应用信任它的 Transport。工具仍会执行 URL 和重定向预检，但自定义 Transport 的实际拨号行为由应用负责；如果仍需要默认的拨号期地址校验，应使用工具自带的 Client。
+
+---
+
+## 12.6 集成到 Harness
 
 ```go
 func (h *Harness) RunAgent(ctx context.Context, name, input string) *engine.RunOutput {
-	// Layer 1: 输入校验
-	if err := h.ValidateInput(input); err != nil {
-		return errorOutput(err)
+	// 先确认目标存在。
+	runtimeAgent, ok := h.Agent(name)
+	if !ok {
+		runErr := types.NewError(types.ErrInvalidConfig, fmt.Sprintf("agent %q not found", name))
+		return &engine.RunOutput{Success: false, Error: runErr.Error(), Err: runErr}
 	}
 
-	// 执行 Agent
-	runtimeAgent, ok := h.Agent(name)
-	if !ok { return errorOutput(fmt.Errorf("agent %q not found", name)) }
-	output := runtimeAgent.Run(ctx, input)
+	// Layer 1: 按配置脱敏，再做输入校验。
+	validatedInput := h.Sanitize(input)
+	if err := h.ValidateInput(validatedInput); err != nil {
+		runErr := types.WrapError(types.ErrInvalidInput, "input validation failed", err)
+		return &engine.RunOutput{Success: false, Error: runErr.Error(), Err: runErr}
+	}
+
+	// Layer 2-3: Agent 内部在执行受控 Tool 前检查权限和参数。
+	output := runtimeAgent.Run(ctx, validatedInput)
 
 	// Layer 4: 输出安全
 	if output.Success {
 		if err := h.ValidateOutput(output.Content); err != nil {
-			return errorOutput(err)
+			runErr := types.WrapError(types.ErrInvalidInput, "output validation failed", err)
+			output.Success = false
+			output.Error = runErr.Error()
+			output.Err = runErr
+			return output
 		}
 		output.Content = h.Sanitize(output.Content)
 	}
@@ -266,26 +311,31 @@ func (h *Harness) RunAgent(ctx context.Context, name, input string) *engine.RunO
 
 ---
 
-## 12.6 安全清单
+## 12.7 安全清单
 
 | 检查项 | 实现位置 | 状态 |
 |-------|---------|------|
 | 输入长度限制 | InputValidator | ✅ |
-| Prompt 注入检测 | InputValidator | ✅ |
-| 权限检查 | PermissionManager.Check() | ✅ |
-| 路径遍历防护 | file_ops.go safePath() | ✅ |
-| PII 脱敏 | Sanitizer | ✅ |
+| Prompt 注入检测 | InputValidator | ✅（由配置开关启用） |
+| 权限检查 | PermissionManager.Check() | ✅（只覆盖已映射工具） |
+| Agent 最小工具集合 | ToolDefinition 过滤 + 执行前复查 | ✅（使用 `CreateAgentWithTools`） |
+| 路径与符号链接逃逸防护 | `os.OpenRoot` 相对操作 | ✅ |
+| HTTP SSRF 防护 | URL、DNS、重定向与拨号地址校验 | ✅ |
+| 文件/HTTP 响应上限 | 有界读取与截断标记 | ✅ |
+| PII 脱敏 | Sanitizer | ✅（由配置开关启用） |
 | 工具参数校验 | BaseTool.Validate() | ✅ |
-| 审计日志 | slog 记录所有工具调用 | ✅ |
+| 基础运行日志 | slog 记录工具名和失败 | ✅ |
+| 完整不可篡改审计 | 当前未内置 | 扩展 |
 
 ---
 
-## 12.7 本章小结
+## 12.8 本章小结
 
 - 建立了四层安全防线：输入 → 权限 → 执行 → 输出
 - 实现了基于 Permission 的细粒度权限控制
 - 实现了基于正则的 Prompt 注入检测
-- 实现了路径遍历防护机制
+- 文件工具在真实打开边界阻止路径和符号链接逃逸，并限制资源使用
+- HTTP 工具默认拒绝私网目标并重新校验重定向
 - 实现了 PII 脱敏系统
 
 ---
@@ -295,3 +345,4 @@ func (h *Harness) RunAgent(ctx context.Context, name, input string) *engine.RunO
 1. 为 PermissionManager 添加 Audit 模式——不阻断越权操作，但记录完整审计日志
 2. 实现"高危操作审批"流程：写文件、发邮件等操作需要二次确认
 3. 添加 IP 和用户代理的请求频率限制（Rate Limiting），防止极端情况下的滥用
+4. 为 `http_get` 增加“公网 URL 重定向到回环地址”的测试，确认第二个目标被拒绝

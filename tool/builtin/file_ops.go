@@ -3,12 +3,15 @@ package builtin
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
 	"github.com/apexracing/tracklogic-agent/model"
 	"github.com/apexracing/tracklogic-agent/tool"
 )
+
+const maxFileContentBytes = 1 << 20
 
 type ReadFileTool struct {
 	tool.BaseTool
@@ -19,12 +22,12 @@ func NewReadFile(allowedDir string) *ReadFileTool {
 	return &ReadFileTool{
 		BaseTool: tool.NewBaseTool(
 			"read_file",
-			"Read the contents of a file. Only files within the allowed directory can be read.",
+			"Read a file within the configured root directory (maximum 1 MiB).",
 			[]model.ToolParameter{
-				{Name: "path", Type: "string", Description: "Relative path to the file", Required: true},
+				{Name: "path", Type: "string", Description: "Path relative to the configured root", Required: true},
 			},
 		),
-		allowedDir: allowedDir,
+		allowedDir: normalizeAllowedDir(allowedDir),
 	}
 }
 
@@ -33,42 +36,33 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) (any, e
 	if path == "" {
 		return nil, fmt.Errorf("path is required")
 	}
-
-	fullPath, err := t.safePath(path)
-	if err != nil {
+	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
 
-	data, err := os.ReadFile(fullPath)
+	root, err := os.OpenRoot(t.allowedDir)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
+		return nil, fmt.Errorf("open allowed directory: %w", err)
 	}
+	defer root.Close()
 
+	file, err := root.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("securely open file %q: %w", path, err)
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, maxFileContentBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read file %q: %w", path, err)
+	}
+	if len(data) > maxFileContentBytes {
+		return nil, fmt.Errorf("file %q exceeds %d bytes", path, maxFileContentBytes)
+	}
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
 	return string(data), nil
-}
-
-func (t *ReadFileTool) safePath(path string) (string, error) {
-	if t.allowedDir == "" {
-		abs, err := filepath.Abs(path)
-		if err != nil {
-			return "", err
-		}
-		return abs, nil
-	}
-	fullPath := filepath.Join(t.allowedDir, path)
-	absPath, err := filepath.Abs(fullPath)
-	if err != nil {
-		return "", err
-	}
-	absAllowed, err := filepath.Abs(t.allowedDir)
-	if err != nil {
-		return "", err
-	}
-	rel, err := filepath.Rel(absAllowed, absPath)
-	if err != nil || len(rel) >= 2 && rel[:2] == ".." || rel == ".." {
-		return "", fmt.Errorf("path traversal detected: %q is outside allowed directory", path)
-	}
-	return absPath, nil
 }
 
 type WriteFileTool struct {
@@ -80,56 +74,65 @@ func NewWriteFile(allowedDir string) *WriteFileTool {
 	return &WriteFileTool{
 		BaseTool: tool.NewBaseTool(
 			"write_file",
-			"Write content to a file. Creates parent directories if needed.",
+			"Write a file within the configured root directory (maximum 1 MiB).",
 			[]model.ToolParameter{
-				{Name: "path", Type: "string", Description: "Relative path to the file", Required: true},
+				{Name: "path", Type: "string", Description: "Path relative to the configured root", Required: true},
 				{Name: "content", Type: "string", Description: "Content to write", Required: true},
 			},
 		),
-		allowedDir: allowedDir,
+		allowedDir: normalizeAllowedDir(allowedDir),
 	}
 }
 
 func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) (any, error) {
 	path, _ := args["path"].(string)
 	content, _ := args["content"].(string)
-
-	fullPath, err := t.safePath(path)
-	if err != nil {
+	if path == "" {
+		return nil, fmt.Errorf("path is required")
+	}
+	if len(content) > maxFileContentBytes {
+		return nil, fmt.Errorf("content exceeds %d bytes", maxFileContentBytes)
+	}
+	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-		return nil, fmt.Errorf("failed to create directories: %w", err)
+	root, err := os.OpenRoot(t.allowedDir)
+	if err != nil {
+		return nil, fmt.Errorf("open allowed directory: %w", err)
 	}
+	defer root.Close()
 
-	if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
-		return nil, fmt.Errorf("failed to write file: %w", err)
+	parent := filepath.Dir(path)
+	if parent != "." {
+		if err := root.MkdirAll(parent, 0o755); err != nil {
+			return nil, fmt.Errorf("securely create parent directory for %q: %w", path, err)
+		}
 	}
-
+	if err := root.WriteFile(path, []byte(content), 0o644); err != nil {
+		return nil, fmt.Errorf("securely write file %q: %w", path, err)
+	}
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
 	return map[string]any{"path": path, "size": len(content)}, nil
 }
 
-func (t *WriteFileTool) safePath(path string) (string, error) {
-	if t.allowedDir == "" {
-		abs, err := filepath.Abs(path)
-		if err != nil {
-			return "", err
-		}
-		return abs, nil
+func normalizeAllowedDir(directory string) string {
+	if directory == "" {
+		return "."
 	}
-	fullPath := filepath.Join(t.allowedDir, path)
-	absPath, err := filepath.Abs(fullPath)
-	if err != nil {
-		return "", err
+	return directory
+}
+
+func contextError(ctx context.Context) error {
+	if ctx == nil {
+		return nil
 	}
-	absAllowed, err := filepath.Abs(t.allowedDir)
-	if err != nil {
-		return "", err
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
 	}
-	rel, err := filepath.Rel(absAllowed, absPath)
-	if err != nil || len(rel) >= 2 && rel[:2] == ".." || rel == ".." {
-		return "", fmt.Errorf("path traversal detected")
-	}
-	return absPath, nil
 }
