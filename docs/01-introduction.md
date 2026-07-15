@@ -218,69 +218,57 @@ graph TB
 ### 1.4.1 创建目录结构
 
 ```bash
-mkdir go-harness-tutorial
-cd go-harness-tutorial
+mkdir tracklogic-agent
+cd tracklogic-agent
 
 # 文档目录
 mkdir docs
 
-# 源码主目录
-mkdir -p src/pkg/types          # 共享类型
-mkdir -p src/internal/engine    # 运行时引擎
-mkdir -p src/internal/tool/builtin  # 工具层
-mkdir -p src/internal/memory    # 记忆子系统
-mkdir -p src/internal/model     # 模型集成
-mkdir -p src/internal/orchestrator  # 编排引擎
-mkdir -p src/internal/mcpclient # MCP 协议
-mkdir -p src/internal/security  # 安全体系
-mkdir -p src/internal/harness   # Harness 组装
-mkdir -p src/examples/jd_cs              # 京东客服示例
-mkdir -p src/examples/cmd/jd-cs-service  # 可运行入口
+# 公共库与示例目录
+mkdir -p types engine model memory
+mkdir -p tool/builtin orchestrator security
+mkdir -p internal/mcpclient
+mkdir -p examples/jd_cs
+mkdir -p examples/cmd/jd-cs-service
 ```
 
 ### 1.4.2 初始化 Go 模块
 
 ```bash
-cd src
-go mod init go-harness-tutorial
+go mod init github.com/apexracing/tracklogic-agent
 ```
 
 ### 1.4.3 目录结构说明
 
 ```
-go-harness-tutorial/
+tracklogic-agent/
+├── agent.go             ← 根包公共 façade
+├── harness.go           ← Harness 组装
+├── config.go            ← 公共配置
+├── types/               ← 共享类型定义
+├── engine/              ← 运行时引擎
+├── model/               ← 模型集成
+├── memory/              ← 记忆
+├── tool/                ← 工具层与 builtin
+├── orchestrator/        ← Team 与 Workflow
+├── security/            ← 安全体系
+├── internal/mcpclient/  ← 非公开 MCP 客户端
+├── examples/            ← 京东客服示例与入口
 ├── docs/                ← 教程文档（13 章）
-├── src/                 ← 完整 Go 源码
-│   ├── pkg/types/       ← 共享类型定义
-│   │   ├── message.go   ← 消息模型
-│   │   ├── errors.go    ← 结构化错误
-│   │   └── context.go   ← 运行上下文
-│   ├── internal/        ← 核心实现（不对外导出）
-│   │   ├── engine/      ← 运行时引擎
-│   │   ├── tool/        ← 工具层
-│   │   ├── memory/      ← 记忆
-│   │   ├── model/       ← 模型集成
-│   │   ├── orchestrator/← 编排
-│   │   ├── mcpclient/   ← MCP 客户端
-│   │   ├── security/    ← 安全
-│   │   └── harness/     ← 组装
-│   └── examples/        ← 示例（与 internal 解耦）
-│       ├── jd_cs/       ← 京东客服业务代码
-│       ├── cmd/jd-cs-service/ ← 可运行入口
-│       └── config.example.json
 └── README.md
 ```
 
 这种结构遵循 Go 项目的标准布局：
-- `internal/` 目录确保这些包不会被外部项目导入（Go 编译器强制）
-- `pkg/` 目录存放可能被外部引用的类型
-- `examples/` 存放演示代码与可执行入口，不放入 `internal`
+- 根包 `agent` 提供最常用的创建和运行入口
+- 公共子包提供 Model、Tool、Memory 和编排扩展接口
+- `internal/` 只保留不承诺兼容性的 MCP 实现细节
+- `examples/` 存放演示代码与可执行入口
 
 ---
 
 ## 1.5 定义核心类型
 
-核心类型是所有子系统的共享基础。它们定义在 `pkg/types/` 中。
+核心类型是所有子系统的共享基础。它们定义在公开的 `types/` 包中。
 
 ### 1.5.1 消息模型（message.go）
 

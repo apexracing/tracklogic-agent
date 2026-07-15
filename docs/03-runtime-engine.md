@@ -494,11 +494,11 @@ import (
 	"log/slog"
 	"os"
 
-	"go-harness-tutorial/internal/engine"
-	"go-harness-tutorial/internal/memory"
-	"go-harness-tutorial/internal/model"
-	"go-harness-tutorial/internal/tool"
-	"go-harness-tutorial/internal/tool/builtin"
+	"github.com/apexracing/tracklogic-agent/engine"
+	"github.com/apexracing/tracklogic-agent/memory"
+	"github.com/apexracing/tracklogic-agent/model"
+	"github.com/apexracing/tracklogic-agent/tool"
+	"github.com/apexracing/tracklogic-agent/tool/builtin"
 )
 
 func main() {

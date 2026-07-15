@@ -377,76 +377,64 @@ func LoadConfig(path string) (Config, error) {
 
 ## 2.5 依赖关系图
 
-```
-pkg/types    ←  所有包依赖（零外部依赖）
-   ↑
-internal/model    internal/memory    internal/tool
-   ↑                    ↑                ↑
-   └────────┬───────────┴─────┬──────────┘
-            │                 │
-    internal/engine           │
-            ↑                 │
-    internal/orchestrator     │
-            ↑                 │
-    internal/mcpclient        │
-            ↑                 │
-    internal/security         │
-            ↑                 │
-    internal/harness ─────────┘
-            ↑
-    examples/jd_cs
-            ↑
-    examples/cmd/jd-cs-service
+```text
+types ← model / memory
+model ← tool
+model + memory + tool ← engine
+engine + model ← orchestrator
+model ← internal/mcpclient
+以上公开包 + internal/mcpclient ← 根包 agent
+根包 agent + 公开扩展包 ← examples
 ```
 
 ```mermaid
 graph TB
-    TYPES["pkg/types<br/>核心类型"]
+    TYPES["types<br/>核心类型"]
     
-    MODEL["internal/model<br/>模型接口"]
-    MEMORY["internal/memory<br/>记忆接口"]
-    TOOL["internal/tool<br/>工具接口"]
-    BUILTIN["internal/tool/builtin<br/>内置工具"]
+    MODEL["model<br/>模型接口"]
+    MEMORY["memory<br/>记忆接口"]
+    TOOL["tool<br/>工具接口"]
+    BUILTIN["tool/builtin<br/>内置工具"]
     
-    ENGINE["internal/engine<br/>运行时引擎"]
-    ORCH["internal/orchestrator<br/>编排引擎"]
+    ENGINE["engine<br/>运行时引擎"]
+    ORCH["orchestrator<br/>编排引擎"]
     MCP["internal/mcpclient<br/>MCP 客户端"]
-    SEC["internal/security<br/>安全体系"]
-    HARNESS["internal/harness<br/>组装门面"]
+    SEC["security<br/>安全体系"]
+    HARNESS["agent<br/>根包组装门面"]
     JDCS["examples/jd_cs<br/>京东客服"]
     MAIN["examples/cmd/jd-cs-service<br/>入口"]
     
-    TYPES --> MODEL
-    TYPES --> MEMORY
-    TYPES --> ENGINE
-    TYPES --> TOOL
+    MODEL --> TYPES
+    MEMORY --> TYPES
     
-    MODEL --> ENGINE
-    MEMORY --> ENGINE
-    TOOL --> BUILTIN
-    TOOL --> ENGINE
+    TOOL --> MODEL
+    BUILTIN --> TOOL
+    ENGINE --> MODEL
+    ENGINE --> MEMORY
+    ENGINE --> TOOL
     
-    ENGINE --> ORCH
-    MODEL --> MCP
-    ENGINE --> HARNESS
-    TOOL --> HARNESS
-    MEMORY --> HARNESS
-    MODEL --> HARNESS
-    ORCH --> HARNESS
-    MCP --> HARNESS
-    SEC --> HARNESS
+    ORCH --> ENGINE
+    ORCH --> MODEL
+    MCP --> MODEL
+    HARNESS --> ENGINE
+    HARNESS --> TOOL
+    HARNESS --> MEMORY
+    HARNESS --> MODEL
+    HARNESS --> ORCH
+    HARNESS --> MCP
+    HARNESS --> SEC
     
-    HARNESS --> JDCS
-    JDCS --> MAIN
+    JDCS --> HARNESS
+    MAIN --> JDCS
 ```
 
-注意箭头方向：箭头表示"依赖于"。`pkg/types` 位于最底层，被所有包依赖。
+注意箭头方向：箭头从调用方指向其依赖。`types` 位于最底层，被多个公开包依赖。
 
 **设计要点**：
-- `pkg/types` 位于最底层，不依赖任何内部包
+- `types` 位于最底层，不依赖其他项目包
 - 上层可以依赖下层，下层不能依赖上层
-- `internal/harness` 是组装中心，依赖所有子系统
-- 应用示例（`jd_cs`）依赖 `harness`，但 `harness` 不依赖任何示例
+- 根包 `agent` 是组装中心，依赖所有子系统
+- 应用示例（`jd_cs`）依赖根包和公开扩展包，但库不依赖任何示例
 
 ---
 

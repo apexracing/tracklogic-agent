@@ -23,7 +23,7 @@ graph LR
 
 ## 6.1 Model 接口
 
-定义位于 src/internal/model/interface.go：
+定义位于 `model/interface.go`：
 
 ```go
 type Model interface {
@@ -44,7 +44,7 @@ type Model interface {
 
 ## 6.2 三种 HTTP 协议（+ mock）
 
-本仓库通过 api_format 映射到 internal/model 下的实现：
+本仓库通过 api_format 映射到 `model` 包中的实现：
 
 | api_format | 实现类型 | 典型场景 |
 |------------|----------|----------|
@@ -59,7 +59,7 @@ type Model interface {
 
 ## 6.3 BuildModel：按 api_format 构造
 
-ModelConfig 与 BuildModel() 位于 src/internal/harness/config.go：
+ModelConfig 与 BuildModel() 位于根包的 `config.go`：
 
 ```go
 type ModelConfig struct {
@@ -104,7 +104,7 @@ DefaultModel: ModelConfig{
 
 ## 6.4 配置文件：config.example.json
 
-Demo 使用的完整配置在 src/examples/config.example.json：
+Demo 使用的完整配置在 `examples/config.example.json`：
 
 ```json
 {
@@ -125,12 +125,15 @@ Demo 使用的完整配置在 src/examples/config.example.json：
 
 ## 6.5 Demo 硬编码加载
 
-入口 src/examples/cmd/jd-cs-service/main.go：
+入口位于 `examples/cmd/jd-cs-service/main.go`：
 
 ```go
 const configFile = "examples/config.example.json"
 
 cfg, err := harness.LoadConfig(configFile)
+if apiKey := strings.TrimSpace(os.Getenv("TRACKLOGIC_AGENT_API_KEY")); apiKey != "" {
+	cfg.DefaultModel.APIKey = apiKey
+}
 harness.ResolveModelDefaults(&cfg.DefaultModel)
 if cfg.DefaultModel.APIFormat != "mock" && cfg.DefaultModel.APIKey == "" {
 	cfg.DefaultModel.APIFormat = "mock"
@@ -139,8 +142,8 @@ if cfg.DefaultModel.APIFormat != "mock" && cfg.DefaultModel.APIKey == "" {
 
 要点：
 
-1. **无** -config 命令行参数，**无** MODEL_* 环境变量覆盖。
-2. 必须在 **src/** 目录执行 go run ./examples/cmd/jd-cs-service，使相对路径 examples/config.example.json 可解析。
+1. **无** `-config` 命令行参数和通用 `MODEL_*` 环境变量；真实测试只允许用 `TRACKLOGIC_AGENT_API_KEY` 覆盖 Key。
+2. 必须在**仓库根目录**执行 `go run ./examples/cmd/jd-cs-service`，使相对路径 `examples/config.example.json` 可解析。
 3. LoadConfig 采用「先 DefaultConfig 再 JSON 覆盖」；文件缺失时打 warn 并使用默认值。
 
 ---

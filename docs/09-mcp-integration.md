@@ -194,7 +194,7 @@ func (c *Client) Initialize(ctx context.Context) error {
 	params := InitializeParams{
 		ProtocolVersion: "2025-03-26",
 		ClientInfo: Implementation{
-			Name:    "go-harness",
+			Name:    "tracklogic-agent",
 			Version: "1.0.0",
 		},
 	}
