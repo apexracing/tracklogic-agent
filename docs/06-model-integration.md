@@ -215,7 +215,7 @@ if err != nil {
 _ = response
 ```
 
-`Retryable()` 只做保守的协议级分类：408、425、429、500、502、503、504 返回 true。它**不会自动重试**。是否重试还取决于剩余时间、请求幂等性和应用自己的重试预算，所以策略所有权仍在应用层。
+`Retryable()` 只做保守的协议级分类：408、425、429、500、502、503、504 返回 true。Provider 本身不会重试；Task Runtime 根据 Context 和 `task.RetryConfig` 消耗模型重试预算，普通同步 API 仍只调用一次。
 
 ### 注入自定义 HTTP Client，而不污染全局状态
 

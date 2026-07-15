@@ -19,8 +19,8 @@ const (
 )
 
 // HTTPError preserves the machine-readable part of an upstream model error.
-// Callers can use errors.As and Retryable to implement an application-owned
-// retry policy without parsing error strings.
+// Callers and Task Runtime can use errors.As and Retryable without parsing
+// error strings.
 type HTTPError struct {
 	Provider   string
 	StatusCode int

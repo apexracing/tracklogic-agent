@@ -263,9 +263,9 @@ func (a *Agent) Run(ctx context.Context, input string) *RunOutput {
 
 ---
 
-## 5.6 扩展：多会话支持
+## 5.6 同步 API 的多会话扩展
 
-生产环境中，不同会话应该有不同的 Memory。可以通过 `map[string]Memory` 实现会话路由；下面是扩展设计，不是当前 Harness 内置 API：
+不使用 Task 模式时，生产环境仍需让不同会话使用不同 Memory。可以通过 `map[string]Memory` 实现会话路由；下面是同步 API 的应用层扩展示例。Task 模式已经用 `(TaskID, AgentID)` 内置隔离，不需要这段 SessionManager：
 
 ```go
 type SessionManager struct {
@@ -287,10 +287,10 @@ func (sm *SessionManager) GetOrCreate(sessionID string) memory.Memory {
 
 初学者容易把“并发安全”和“会话安全”当成同一件事。两者的区别是：
 
-| 问题 | 当前 Agent 的保证 | 应用层还要做什么 |
+| 问题 | 同步 Agent 的保证 | Task 模式的保证 |
 |---|---|---|
-| 两个 goroutine 同时调用同一 Agent 会不会破坏内部状态？ | 不会；Run 会串行，Memory 自身也有锁 | 为等待设置 Context 截止时间 |
-| 两个用户会不会读到对方的历史？ | 会，只要它们复用同一个 Agent/Memory | 按会话路由到不同 Agent 或不同 Memory |
+| 两个 goroutine 同时调用同一 Agent 会不会破坏内部状态？ | 不会；Run 会串行，Memory 自身也有锁 | 同一 Task/Agent 串行，不同 Task 可并行 |
+| 两个任务会不会读到对方的历史？ | 会，只要它们复用同一个 Agent/Memory | 不会；TaskID 是上下文隔离键 |
 | 不同会话能否并行执行？ | 可以，前提是使用不同 Agent 实例 | 管理实例生命周期与容量 |
 
 设计思路是让库守住通用的并发正确性，把“什么叫一个会话、何时过期、存到哪里”留给应用决定。后者依赖具体产品，放进通用 Harness 反而会制造错误假设。
@@ -311,4 +311,31 @@ func (sm *SessionManager) GetOrCreate(sessionID string) memory.Memory {
 
 1. 为 BufferMemory 编写并发读写测试，使用 `go test -race ./...` 验证现有 `sync.RWMutex`
 2. 实现 `TTLMemory`：每条消息带有 TTL（Time To Live），过期后自动淘汰
-3. 实现 `SummaryMemory`：当消息超限时，自动调用 LLM 生成摘要，用摘要替换旧消息
+3. 为 `SummaryMemory` 注入一个确定性测试摘要器，验证成功压缩与硬上限失败
+
+---
+
+## 5.8 Task 模式为什么不能继续共享 Agent Memory
+
+旧同步 API 把 `BufferMemory` 放在 Agent 实例上，并用 Agent 级运行闸门串行化访问。这适合单会话示例，却不适合一个 Agent 同时服务多个任务：串行只能防止数据交错，不能阻止 Task A 读取 Task B 的历史。
+
+Task 模式把所有权改为 `(TaskID, AgentID)`：
+
+```text
+Task A ─ assistant → 独立 SummaryMemory + 独立运行闸门
+Task B ─ assistant → 独立 SummaryMemory + 独立运行闸门
+```
+
+因此同一 Task 内同一 Agent 的 Turn 保持顺序，不同 Task 可以并发且上下文隔离。普通 `RunAgent` 仍使用 Agent 自己的 `BufferMemory`，这是“旧同步 API 保持兼容”的具体含义之一。
+
+## 5.9 Summary Memory 的失败边界
+
+默认策略是超过 50 条消息时尝试摘要，摘要成功后保留最近 20 条原文，100 条是硬上限。默认摘要器使用当前 Model、`temperature=0`、不提供任何业务工具；调用方也可通过 `task.Options.Summarizer` 注入实现。
+
+关键设计不是“会摘要”，而是“摘要失败时不丢数据”：
+
+- 未达到硬上限：保留全部原文，当前 Turn 继续；
+- 达到硬上限：返回 `SUMMARY_FAILED`，明确停止；
+- 摘要成功：先更新内存，再发送 `checkpoint.ready` 让上层决定保存摘要、近期消息或两者。
+
+库的 SummaryMemory 是进程内运行状态，不是持久化产品。上层拥有正式聊天记录，可以保存完整消息；库只需要恢复模型继续工作所需的摘要和近期上下文。

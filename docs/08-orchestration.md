@@ -300,7 +300,7 @@ sequenceDiagram
 
 与 Team 的固定模式不同，Workflow 提供显式步骤和可组合控制节点。当前实现不是任意连边的 DAG 调度器：顶层节点严格按 `AddNode` 顺序执行，分支、循环和局部并发由节点内部组合表达。
 
-这个设计有意选择“小而可预测”的执行模型：不需要拓扑排序、边存储和环检测，阅读 `Nodes` 列表就能知道顶层顺序；代价是不能声明任意节点依赖，也不支持断点恢复。需要真正 DAG 调度时，应把它作为新的扩展层，而不是依赖当前 Workflow 的隐含行为。
+这个设计有意选择“小而可预测”的执行模型：不需要拓扑排序、边存储和环检测，阅读 `Nodes` 列表就能知道顶层顺序；代价是不能声明任意节点依赖。Task 模式可为现有控制节点生成与恢复检查点，但它不会把 Workflow 变成任意 DAG 调度器。
 
 ### 8.3.1 Node 接口
 
@@ -566,7 +566,8 @@ Team 和 Workflow 都是长生命周期对象。名称、成员、节点 ID 等�
 | 需要条件分支 | Workflow Condition | 灵活 |
 | 需要循环 | Workflow Loop | 内置循环 |
 | 分支、循环、局部并发 | Workflow | 控制流显式、状态可共享 |
-| 任意 DAG、拓扑依赖、断点恢复 | 当前未内置 | 需要扩展调度与持久化层 |
+| 任意 DAG、拓扑依赖 | 当前未内置 | 需要扩展调度层 |
+| Task 检查点 | 已内置 | 库生成状态快照，上层负责保存与装配恢复输入 |
 
 ---
 
@@ -583,5 +584,15 @@ Team 和 Workflow 都是长生命周期对象。名称、成员、节点 ID 等�
 ## 练习
 
 1. 为 Team 添加 Consensus（共识）模式：所有 Agent 多轮讨论，每轮并行执行，直到达成共识
-2. 为 Workflow 添加 Resume 功能：每步执行后保存快照，失败后可从断点恢复
+2. 为自定义 Node 实现 `CheckpointableNode`，验证旧同步 Workflow 不受影响而 Task 模式会拒绝不可恢复节点
 3. 实现 Workflow 的 `RouterNode`：根据 state 中的值路由到不同的子节点路径
+
+---
+
+## 8.7 为什么 Task 模式要求 CheckpointableNode
+
+同步 Workflow 只需要 Node 能执行；可恢复 Workflow 还必须知道“进程退出后怎样重建 Node 自己的状态”。内置 Step、Condition、Loop 和 Parallel 的状态由运行器认识，自定义 Node 则必须实现 `workflow.CheckpointableNode`。这项校验只在 `Task.StartWorkflow` 启动阶段执行，旧的 `RunWorkflow` 不改变。
+
+Workflow 检查点记录当前顶层节点位置、下一节点、当前输入、State JSON 快照以及内部 Agent 检查点。Team 检查点记录协作模式、阶段、当前 Agent、已有输出和内部 Agent 检查点。这样恢复协议仍然属于 Harness，而保存介质、版本迁移和任务列表属于上层应用。
+
+外部 Tool 是恢复设计里最重要的安全边界。执行前先确认 Agent 检查点，再确认 `tool.started`，最后才调用 Tool。如果恢复数据只有 started 而没有 completed，库返回 `RUN_INTERRUPTED`，因为再次执行可能产生重复副作用。等待用户答案不同：它尚未执行外部副作用，所以可以用原 TurnID 和 ToolCallID 安全继续。

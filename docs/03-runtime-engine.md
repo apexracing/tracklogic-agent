@@ -546,7 +546,7 @@ type RunOutput struct {
 
 之所以复制 `RunContext` 而不原地修改指针，是为了避免多个并发 Agent 共享父 Context 时互相覆盖 `AgentID`。这是 Context 的重要设计习惯：把它当作不可变的调用链载体，而不是跨 goroutine 的可变参数袋。
 
-当前库只负责在调用链中传递 RunContext。应用可以在入口日志中记录 `RunOutput.RunID`，自定义 Model/Tool 也可以通过 `types.RunContextFrom(ctx)` 读取关联信息。RunID 是通用的排错关联键，不代表本库拥有数据分析或报告职责。
+当前库只负责在调用链中传递 RunContext。应用可以在入口日志中记录 `RunOutput.RunID`，自定义 Model/Tool 也可以通过 `types.RunContextFrom(ctx)` 读取关联信息。RunID 是通用的排错关联键，不代表本库拥有业务数据处理或报告职责。
 
 ---
 
@@ -700,3 +700,89 @@ Agent 注册的工具集在运行期间可能发生变化。如果模型调用�
 2. 将 `WithStream` 的回调升级为结构化事件通道（例如区分 content / tool_call / done），便于上层做 SSE
 3. 为 `RunOutput.Messages` 编写跨两次 Run 的测试，确认它返回 Agent Memory 快照而不是仅本次增量
 4. 实现一个简单的 `maxLoops` 检测机制：当连续 3 次调用同一个工具且参数相同时，强制终止
+
+---
+
+## 3.10 Task、Turn、Item：为什么要分三层
+
+旧的 `Harness.RunAgent` 是同步 API：调用方等待一个 `RunOutput`，适合命令行、测试和短请求。它继续保持原行为。需要后台运行、实时页面和进程恢复时，单个返回值已经不够，因此 Task 模式增加三级模型：
+
+```text
+Task：调用方拥有 ID 的长期任务会话
+└─ Turn：一次用户请求及其完整处理
+   ├─ Item：用户消息
+   ├─ Item：临时进度或文本增量
+   ├─ Item：工具动作
+   ├─ Item：结构化询问与答案
+   └─ Item：最终回答
+```
+
+这样分层不是为了模仿页面结构，而是解决三个不同生命周期：Task 决定上下文隔离，Turn 决定运行、等待、取消和耗时，Item 决定某一事实如何交付。把三者压成 Message 会迫使工具动作、重试状态和恢复快照伪装成聊天文本。
+
+```go
+runtimeTask, err := h.NewTask(task.Options{
+    TaskID:    taskID, // 调用方生成并长期保存
+    EventSink: sink,
+})
+if err != nil { return err }
+defer runtimeTask.Close()
+
+turn, err := runtimeTask.StartAgent(ctx, "assistant", input)
+if err != nil { return err }
+
+// StartAgent 已经返回，Turn 继续使用 Task 自己的 Context 在后台运行。
+result, err := runtimeTask.WaitTurn(waitCtx, turn.ID)
+```
+
+`waitCtx` 只控制“调用方还要不要等待”，不会取消 Turn。明确停止运行要调用 `CancelTurn`；关闭整个内存实例调用 `Close`。这一区分正是客户端断线不应终止后台任务的原因。
+
+## 3.11 EventSink 是确认协议，不是存储接口
+
+每个事件都有单调递增的 `Sequence`、稳定的 TaskID/TurnID/RunID/ItemID、发生时间和结构化 Payload。两种 Delivery 的含义是：
+
+- `best_effort`：文本增量、当前阶段和重试等待。交付失败不阻止运行；上层通常只显示最新值。
+- `required_ack`：用户消息、询问、答案、Memory 检查点和最终消息。`Emit` 返回 `nil` 前，库不会跨过该安全边界。
+
+```go
+type EventSink interface {
+    Emit(context.Context, task.Event) error
+}
+```
+
+接口故意没有 `Load`、`Update`、`Delete` 或路径配置。上层可以写数据库、发布消息、只做内存测试，也可以在一个事务里同时处理事件和检查点；库不需要知道。恢复方向同样反转：上层读取自己的数据，再把 `task.RestoreInput` 交回 `RestoreTask`。
+
+如果产品需要一个长期运行的 App Server，它也属于上层应用：它把 HTTP/JSON、SSE 或 WebSocket 转换成 `Start*`、`AnswerInteraction`、`CancelTurn` 等库调用，并实现鉴权、历史补发和断线重连。本库不提供服务器、路由、端口或传输协议，因而同一 Task Runtime 可以用于桌面端、命令行、Web 服务或测试。
+
+## 3.12 正式消息、任务详情与临时状态
+
+运行事件不等于正式聊天记录。建议上层采用以下默认映射：
+
+| 事件 | 建议位置 | 原因 |
+|---|---|---|
+| `message.user`、`message.assistant_completed` | 正式聊天记录 | 用户日后需要看到 |
+| `interaction.requested/responded` | 正式记录中的折叠卡片 | 它改变了任务决策 |
+| `tool.started/completed` | 任务详情，默认折叠 | 对排错有用，但不是对话正文 |
+| `model.attempt_started/retry_waiting` | 仅实时状态 | 断线后通常无需补成聊天消息 |
+| `progress.updated` | 仅显示最新状态 | 描述当前工作阶段，不是历史结论 |
+| `checkpoint.ready` | 不发给普通客户端 | 只服务恢复 |
+
+库不输出模型隐藏推理。页面里的“正在思考”由 `Phase`（准备上下文、请求模型、执行工具、整理回答）和模型主动调用 `report_progress` 产生的短摘要组成。摘要最长 200 个 Unicode 字符，每 Turn 最多 20 次；它描述“正在做什么”，不能包含未公开的逐步推理。
+
+动态耗时无需服务端每秒发送事件。客户端从 `turn.started.OccurredAt` 开始本地计时；Turn 结束后改用固定的 `ElapsedMS`。这样断线重连不会制造大量无业务含义的计时事件。
+
+## 3.13 结构化询问为何必须暂停同一 Turn
+
+`request_user_input` 是 Task 模式内部控制能力，不进入业务 Tool Registry。模型请求询问后，运行顺序是：
+
+```text
+写出包含 Memory 与待回答 ToolCall 的检查点
+→ 上层确认 checkpoint.ready
+→ 上层确认 interaction.requested
+→ Turn 进入 waiting_input
+→ 上层调用 AnswerInteraction
+→ 答案被确认
+→ 以原 TurnID 和原 ToolCallID 写回 Tool 消息
+→ 同一模型循环继续
+```
+
+检查点必须先于暂停，因为进程可能在问题显示后立即退出。答案必须带原 ToolCallID，因为模型协议用它把 Tool 结果和先前请求关联起来。`RestoreTask` 不访问任何存储，只接受上层已经装配好的检查点和最后 Sequence。

@@ -68,4 +68,5 @@ type AgentConfig struct {
 	MaxLoops            int
 	CheckToolPermission func(toolName string) error
 	Logger              *slog.Logger
+	Reliability         *ReliabilityManager
 }

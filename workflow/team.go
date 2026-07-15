@@ -11,6 +11,7 @@ import (
 
 	"github.com/apexracing/tracklogic-agent/engine"
 	"github.com/apexracing/tracklogic-agent/model"
+	"github.com/apexracing/tracklogic-agent/task"
 )
 
 type TeamMode string
@@ -73,6 +74,9 @@ func (t *Team) Run(ctx context.Context, input string) *TeamOutput {
 		ctx = context.Background()
 	}
 	t.logger.Info("team run started", "mode", t.Mode)
+	if err := t.emitCheckpoint(ctx, "starting", 0, input, nil, ""); err != nil {
+		return &TeamOutput{Success: false, Error: err.Error(), Err: err}
+	}
 
 	switch t.Mode {
 	case ModeSequential:
@@ -85,6 +89,155 @@ func (t *Team) Run(ctx context.Context, input string) *TeamOutput {
 		err := fmt.Errorf("unknown mode: %s", t.Mode)
 		return &TeamOutput{Success: false, Error: err.Error(), Err: err}
 	}
+}
+
+// Resume continues a Team suspended at a safe Agent interaction checkpoint.
+func (t *Team) Resume(ctx context.Context, checkpoint task.TeamCheckpoint, toolResult string) *TeamOutput {
+	if err := t.Validate(); err != nil {
+		return &TeamOutput{Success: false, Error: err.Error(), Err: err}
+	}
+	if checkpoint.TeamID != t.Name || checkpoint.Agent == nil || checkpoint.Agent.PendingToolCall == nil {
+		err := fmt.Errorf("team checkpoint is not resumable")
+		return &TeamOutput{Success: false, Error: err.Error(), Err: err}
+	}
+	pendingAgent := t.agentByName(checkpoint.Agent.AgentID)
+	if pendingAgent == nil {
+		err := fmt.Errorf("team agent %q not found", checkpoint.Agent.AgentID)
+		return &TeamOutput{Success: false, Error: err.Error(), Err: err}
+	}
+	options := []engine.RunOption(nil)
+	if t.SharedModel != nil {
+		options = append(options, engine.WithModel(t.SharedModel))
+	}
+	resumed := pendingAgent.Resume(ctx, *checkpoint.Agent, toolResult, options...)
+	outputs := make(map[string]*engine.RunOutput, len(checkpoint.AgentOutputs)+1)
+	for name, content := range checkpoint.AgentOutputs {
+		outputs[name] = &engine.RunOutput{Content: content, Success: true}
+	}
+	outputs[pendingAgent.Name()] = resumed
+	if !resumed.Success {
+		return teamFailure(outputs, resumed.Content, fmt.Errorf("agent %s failed: %w", pendingAgent.Name(), runOutputError(resumed)))
+	}
+
+	switch t.Mode {
+	case ModeSequential:
+		current := resumed.Content
+		start := checkpoint.CurrentIndex + 1
+		for index := start; index < len(t.Agents); index++ {
+			runtimeAgent := t.Agents[index]
+			if err := t.emitCheckpoint(ctx, "agent", index, current, outputs, runtimeAgent.Name()); err != nil {
+				return teamFailure(outputs, current, err)
+			}
+			output := t.runAgent(ctx, runtimeAgent, current)
+			outputs[runtimeAgent.Name()] = output
+			if !output.Success {
+				return teamFailure(outputs, output.Content, fmt.Errorf("agent %s failed: %w", runtimeAgent.Name(), runOutputError(output)))
+			}
+			current = output.Content
+		}
+		return &TeamOutput{AgentOutputs: outputs, FinalOutput: current, Success: true}
+	case ModeParallel:
+		for _, runtimeAgent := range t.Agents {
+			name := runtimeAgent.Name()
+			if _, exists := outputs[name]; exists {
+				continue
+			}
+			saved := checkpoint.Agents[name]
+			if saved == nil || saved.PendingToolCall != nil || saved.LastContent == "" {
+				err := fmt.Errorf("parallel agent %q state is incomplete; refusing unsafe replay", name)
+				return teamFailure(outputs, "", err)
+			}
+			outputs[name] = &engine.RunOutput{Content: saved.LastContent, Success: true, Messages: saved.Messages, ToolCalls: saved.ToolCalls, TotalTokens: saved.TotalTokens, LoopCount: saved.LoopCount}
+		}
+		parts := make([]string, 0, len(t.Agents))
+		for _, runtimeAgent := range t.Agents {
+			parts = append(parts, fmt.Sprintf("**%s**: %s", runtimeAgent.Name(), outputs[runtimeAgent.Name()].Content))
+		}
+		return &TeamOutput{AgentOutputs: outputs, FinalOutput: strings.Join(parts, "\n\n"), Success: true}
+	case ModeLeaderFollower:
+		return t.resumeLeaderFollower(ctx, checkpoint, outputs, resumed)
+	default:
+		err := fmt.Errorf("unknown team mode %q", t.Mode)
+		return teamFailure(outputs, "", err)
+	}
+}
+
+func (t *Team) resumeLeaderFollower(ctx context.Context, checkpoint task.TeamCheckpoint, outputs map[string]*engine.RunOutput, resumed *engine.RunOutput) *TeamOutput {
+	leaderName := t.Leader.Name()
+	switch checkpoint.Phase {
+	case "leader_synthesis":
+		return &TeamOutput{AgentOutputs: outputs, FinalOutput: resumed.Content, Success: true}
+	case "leader_plan":
+		// Continue below with the resumed plan.
+	case "follower":
+		// Existing outputs and the resumed follower are already populated.
+	default:
+		return teamFailure(outputs, "", fmt.Errorf("unknown leader/follower checkpoint phase %q", checkpoint.Phase))
+	}
+	plan := outputs[leaderName]
+	if checkpoint.Phase == "leader_plan" {
+		plan = resumed
+		outputs[leaderName] = resumed
+	}
+	if plan == nil || !plan.Success {
+		return teamFailure(outputs, "", fmt.Errorf("leader plan is unavailable"))
+	}
+	for index, runtimeAgent := range t.Agents {
+		name := runtimeAgent.Name()
+		if name == leaderName {
+			continue
+		}
+		if existing := outputs[name]; existing != nil && existing.Success {
+			continue
+		}
+		if index <= checkpoint.CurrentIndex && checkpoint.Phase == "follower" {
+			continue
+		}
+		followerInput := fmt.Sprintf("Plan: %s\n\nTask: %s\n\nYour role: %s", plan.Content, checkpoint.CurrentInput, runtimeAgent.SystemPrompt())
+		output := t.runAgent(ctx, runtimeAgent, followerInput)
+		outputs[name] = output
+		if !output.Success {
+			return teamFailure(outputs, "", fmt.Errorf("follower %s failed: %w", name, runOutputError(output)))
+		}
+	}
+	synthesis := t.runAgent(ctx, t.Leader, fmt.Sprintf("Synthesize the following results into a final answer.\n\nOriginal request: %s\n\nResults:\n%s", checkpoint.CurrentInput, t.formatOutputs(outputs)))
+	outputs[leaderName] = synthesis
+	if !synthesis.Success {
+		return teamFailure(outputs, synthesis.Content, fmt.Errorf("leader synthesis failed: %w", runOutputError(synthesis)))
+	}
+	return &TeamOutput{AgentOutputs: outputs, FinalOutput: synthesis.Content, Success: true}
+}
+
+func (t *Team) agentByName(name string) *engine.Agent {
+	for _, runtimeAgent := range t.Agents {
+		if runtimeAgent.Name() == name {
+			return runtimeAgent
+		}
+	}
+	if t.Leader != nil && t.Leader.Name() == name {
+		return t.Leader
+	}
+	return nil
+}
+
+func teamFailure(outputs map[string]*engine.RunOutput, final string, err error) *TeamOutput {
+	if err == nil {
+		err = fmt.Errorf("team failed")
+	}
+	return &TeamOutput{AgentOutputs: outputs, FinalOutput: final, Success: false, Error: err.Error(), Err: err}
+}
+
+func runOutputError(output *engine.RunOutput) error {
+	if output == nil {
+		return fmt.Errorf("Agent returned no output")
+	}
+	if output.Err != nil {
+		return output.Err
+	}
+	if output.Error != "" {
+		return errors.New(output.Error)
+	}
+	return fmt.Errorf("Agent failed")
 }
 
 // Validate checks the structural invariants required by every Team run.
@@ -140,8 +293,11 @@ func (t *Team) runSequential(ctx context.Context, input string) *TeamOutput {
 	outputs := make(map[string]*engine.RunOutput)
 	currentInput := input
 
-	for _, agent := range agents {
+	for index, agent := range agents {
 		name := agent.Name()
+		if err := t.emitCheckpoint(ctx, "agent", index, currentInput, outputs, name); err != nil {
+			return &TeamOutput{AgentOutputs: outputs, FinalOutput: currentInput, Success: false, Error: err.Error(), Err: err}
+		}
 		t.logger.Info("sequential: running agent", "agent", name)
 		output := t.runAgent(ctx, agent, currentInput)
 		outputs[name] = output
@@ -161,6 +317,9 @@ func (t *Team) runSequential(ctx context.Context, input string) *TeamOutput {
 			}
 		}
 		currentInput = output.Content
+		if err := t.emitCheckpoint(ctx, "agent_completed", index+1, currentInput, outputs, ""); err != nil {
+			return &TeamOutput{AgentOutputs: outputs, FinalOutput: currentInput, Success: false, Error: err.Error(), Err: err}
+		}
 	}
 
 	finalOutput := outputs[agents[len(agents)-1].Name()].Content
@@ -188,6 +347,9 @@ func (t *Team) runParallel(ctx context.Context, input string) *TeamOutput {
 		}()
 	}
 	wg.Wait()
+	if err := t.emitCheckpoint(ctx, "parallel_completed", len(t.Agents), input, outputs, ""); err != nil {
+		return &TeamOutput{AgentOutputs: outputs, Success: false, Error: err.Error(), Err: err}
+	}
 
 	var parts []string
 	var failures []error
@@ -233,6 +395,9 @@ func (t *Team) runLeaderFollower(ctx context.Context, input string) *TeamOutput 
 
 	leader := t.Leader
 	leaderName := leader.Name()
+	if err := t.emitCheckpoint(ctx, "leader_plan", 0, input, outputs, leaderName); err != nil {
+		return &TeamOutput{AgentOutputs: outputs, Success: false, Error: err.Error(), Err: err}
+	}
 	planOutput := t.runAgent(ctx, leader, fmt.Sprintf("Plan the approach for: %s\n\nProvide a step-by-step plan.", input))
 	outputs[leaderName] = planOutput
 
@@ -250,10 +415,13 @@ func (t *Team) runLeaderFollower(ctx context.Context, input string) *TeamOutput 
 		}
 	}
 
-	for _, agent := range t.Agents {
+	for index, agent := range t.Agents {
 		name := agent.Name()
 		if name == leaderName {
 			continue
+		}
+		if err := t.emitCheckpoint(ctx, "follower", index, input, outputs, name); err != nil {
+			return &TeamOutput{AgentOutputs: outputs, Success: false, Error: err.Error(), Err: err}
 		}
 		t.logger.Info("follower executing", "agent", name)
 		followerInput := fmt.Sprintf("Plan: %s\n\nTask: %s\n\nYour role: %s", planOutput.Content, input, agent.SystemPrompt())
@@ -269,6 +437,9 @@ func (t *Team) runLeaderFollower(ctx context.Context, input string) *TeamOutput 
 		}
 	}
 
+	if err := t.emitCheckpoint(ctx, "leader_synthesis", len(t.Agents), input, outputs, leaderName); err != nil {
+		return &TeamOutput{AgentOutputs: outputs, Success: false, Error: err.Error(), Err: err}
+	}
 	synthOutput := t.runAgent(ctx, leader, fmt.Sprintf(
 		"Synthesize the following results into a final answer.\n\nOriginal request: %s\n\nResults:\n%s",
 		input, t.formatOutputs(outputs),
@@ -288,6 +459,27 @@ func (t *Team) runLeaderFollower(ctx context.Context, input string) *TeamOutput 
 		result.Error = result.Err.Error()
 	}
 	return result
+}
+
+func (t *Team) emitCheckpoint(ctx context.Context, phase string, index int, current string, outputs map[string]*engine.RunOutput, pending string) error {
+	runtime, taskMode := task.RuntimeFrom(ctx)
+	if !taskMode {
+		return nil
+	}
+	completed := make(map[string]string, len(outputs))
+	for name, output := range outputs {
+		if output != nil && output.Success {
+			completed[name] = output.Content
+		}
+	}
+	checkpoint := task.Checkpoint{
+		Kind: task.TurnTeam, Target: t.Name, Status: task.TurnRunning,
+		Team: &task.TeamCheckpoint{TeamID: t.Name, Mode: string(t.Mode), Phase: phase, CurrentIndex: index, CurrentInput: current, AgentOutputs: completed, PendingAgentID: pending},
+	}
+	if err := runtime.Checkpoint(ctx, checkpoint); err != nil {
+		return fmt.Errorf("team checkpoint: %w", err)
+	}
+	return nil
 }
 
 func (t *Team) formatOutputs(outputs map[string]*engine.RunOutput) string {

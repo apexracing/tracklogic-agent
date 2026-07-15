@@ -17,17 +17,18 @@
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                     应用层 (Application)                      │
-│            JD 智能客服  |  数据分析 Agent  |  ...              │
+│            示例应用  |  其他业务 Agent  |  ...                 │
 ├──────────────────────────────────────────────────────────────┤
 │                      Harness 门面层                           │
-│  统一 API: RunAgent()  RunTeam()  RunWorkflow()              │
+│  同步 API: RunAgent() / RunTeam() / RunWorkflow()            │
+│  Task API: NewTask() / Start*() / WaitTurn() / RestoreTask() │
 │  职责: 安全校验 → 委派执行 → 输出处理                           │
 ├──────────┬───────────┬───────────┬───────────┬───────────────┤
 │  运行时引擎 │   工具层   │  记忆子系统  │  模型集成   │   编排引擎    │
 │  (Engine) │  (Tool)   │ (Memory)  │  (Model)  │  (Orch.)     │
 │           │           │           │           │              │
 │  Agent    │  Registry │  Buffer   │  OpenAI   │  Team        │
-│  Run Loop │  Execute  │ (Summary*)│  Anthropic│  Workflow    │
+│  Run Loop │  Execute  │  Summary  │  Anthropic│  Workflow    │
 ├──────────┴───────────┴───────────┴───────────┴───────────────┤
 │                        安全体系 (Security)                     │
 │  权限管理  |  Prompt 注入检测  |  PII 脱敏  |  路径校验         │
@@ -37,25 +38,26 @@
 └──────────────────────────────────────────────────────────────┘
 ```
 
-`Summary*` 表示扩展点：当前 Harness 只创建 `BufferMemory`。slog、错误码与 RunID 用于排查库的运行问题；分析与报告系统不属于 Harness 的包边界。
+普通同步 API 使用 `BufferMemory`；Task 模式按 `(TaskID, AgentID)` 创建 `SummaryMemory`。Task/Turn/Item、事件和检查点属于通用运行协议；保存介质、网络服务器和聊天页面仍在应用层。
 
 ```mermaid
 graph TB
     subgraph APP["应用层"]
         JD["JD 智能客服"]
-        DA["数据分析 Agent"]
+        DA["其他业务 Agent"]
     end
     
     subgraph FACADE["Harness 门面层"]
         RA["RunAgent()"]
         RT["RunTeam()"]
         RW["RunWorkflow()"]
+        TASK["NewTask() / RestoreTask()"]
     end
     
     subgraph CORE["核心子系统"]
         ENG["运行时引擎<br/>Agent.Run()"]
         TOOL["工具层<br/>Registry + Execute"]
-        MEM["记忆子系统<br/>BufferMemory"]
+        MEM["记忆子系统<br/>BufferMemory / SummaryMemory"]
         MOD["模型集成<br/>OpenAI / Anthropic"]
         ORCH["编排引擎<br/>Team + Workflow"]
     end

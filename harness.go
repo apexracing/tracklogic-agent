@@ -39,6 +39,7 @@ type Harness struct {
 	workflows         map[string]*workflow.Workflow
 	baseLogger        *slog.Logger
 	logger            *slog.Logger
+	reliability       *engine.ReliabilityManager
 }
 
 func New(cfg Config, options ...Option) (*Harness, error) {
@@ -89,6 +90,7 @@ func New(cfg Config, options ...Option) (*Harness, error) {
 		workflows:         make(map[string]*workflow.Workflow),
 		baseLogger:        baseLogger,
 		logger:            baseLogger.With("component", "harness"),
+		reliability:       engine.NewReliabilityManager(),
 	}
 
 	runtimeModel := deps.model
@@ -277,6 +279,7 @@ func (h *Harness) createAgent(name, systemPrompt string, restrictTools bool, too
 		Memory:              memory.NewBufferMemory(h.memoryCapacity),
 		CheckToolPermission: h.checkToolPermission,
 		Logger:              h.baseLogger,
+		Reliability:         h.reliability,
 	})
 	h.mu.Lock()
 	defer h.mu.Unlock()

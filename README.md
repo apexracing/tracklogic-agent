@@ -2,7 +2,7 @@
 
 `tracklogic-agent` 是一个用于构建模型驱动 Agent、工具调用、记忆、Team 和 Workflow 的纯 Go 公共库。根包 `agent` 提供 Harness 与配置入口；`engine`、`model`、`memory`、`tool`、`security`、`types`、`workflow` 和 `mcp` 是职责独立的公共扩展包。
 
-本库只负责通用 Harness。领域数据接入、分析逻辑、结论与报告属于依赖本库的应用，通过自定义 Tool、MCP、Model 或 Workflow 组合实现，不在核心包中定义领域类型。
+本库只负责通用 Harness。业务数据接入、业务逻辑、展示与持久化属于依赖本库的上层应用，通过自定义 Tool、MCP、Model 或 Workflow 组合实现，不在核心包中定义领域类型。
 
 项目同时包含《智能体 Harness 工程指南》的 13 章教程和一个可运行的 JD 智能客服示例。
 
@@ -56,11 +56,29 @@ func main() {
 }
 ```
 
+需要后台 Turn、实时事件和安全恢复时，使用 Task API；TaskID 和事件处理由调用方提供：
+
+```go
+runtimeTask, err := harness.NewTask(task.Options{
+    TaskID:    taskID,
+    EventSink: sink,
+})
+if err != nil { return err }
+defer runtimeTask.Close()
+
+turn, err := runtimeTask.StartAgent(ctx, "assistant", input)
+if err != nil { return err }
+result, err := runtimeTask.WaitTurn(ctx, turn.ID)
+```
+
+Task 模式默认提供模型 5 次尝试、按 Model 实例断路器、Summary Memory、结构化询问和检查点事件。库不提供数据库、JSONL、HTTP/SSE/WebSocket 或默认存储目录；这些属于上层应用。原有 `RunAgent`、`RunTeam`、`RunWorkflow` 和 `Agent.Run` 同步 API 行为保持不变。
+
 ## 公共扩展包
 
 - `engine`：Agent、执行循环、流式输出和运行选项。
 - `model`：Model 接口及 OpenAI、Chat Completions、Anthropic、Mock 实现。
-- `memory`：Memory 接口和并发安全的 BufferMemory。
+- `memory`：Memory 接口、BufferMemory 和 Task 使用的 SummaryMemory。
+- `task`、`interaction`：Task/Turn/Item 事件协议、检查点和结构化用户询问。
 - `tool`、`tool/builtin`：Tool、Registry 和内置工具。
 - `security`：可替换的权限、输入输出校验和脱敏接口。
 - `types`：Message、ToolCall、Usage、RunContext 和结构化错误等跨层协议。

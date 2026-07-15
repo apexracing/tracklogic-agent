@@ -10,7 +10,7 @@
 4. **容错需求**：订单系统、物流系统可能不可用
 5. **编排复杂**：售后流程需要多步骤、有条件分支
 
-这个场景把 Engine、Tool、Memory、Model、Workflow、Security 和 Harness 门面组合起来。MCP、自动重试、持久化会话和生产级业务鉴权仍是扩展方向，不能因为 Demo 可运行就认为生产能力已经齐备。
+这个场景把 Engine、Tool、Memory、Model、Workflow、Security 和 Harness 门面组合起来。Demo 使用旧同步 API，因此没有启用 Task 模式的模型重试、Summary Memory 和检查点；持久化会话和生产级业务鉴权仍由上层应用实现。
 
 本章将前面 12 章的所有子系统组装为一个有业务价值的完整系统：京东智能客服。
 
@@ -601,7 +601,7 @@ flowchart LR
 | 08 | 编排引擎 | 售后处理 Workflow |
 | 09 | MCP 协议 | 可用于未来对接外部物流系统；当前 Demo 使用内存 Tool |
 | 10 | 生产化 | JSON 配置、可注入的 slog 日志 |
-| 11 | 容错 | 当前使用超时、Context 与循环上限；自动重试待扩展 |
+| 11 | 容错 | Demo 使用同步单次调用；Task 模式提供模型重试与断路器 |
 | 12 | 安全 | 权限、脱敏、校验 |
 
 ---

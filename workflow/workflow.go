@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"reflect"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/apexracing/tracklogic-agent/engine"
+	"github.com/apexracing/tracklogic-agent/task"
 )
 
 type NodeType string
@@ -25,6 +27,15 @@ type Node interface {
 	ID() string
 	Type() NodeType
 	Execute(ctx context.Context, input string, state *State) (string, error)
+}
+
+// CheckpointableNode is required for custom Nodes used by Task mode. Built-in
+// Nodes are checkpointed by Workflow itself. Data must describe only the
+// custom Node's resumable state; shared State is captured separately.
+type CheckpointableNode interface {
+	Node
+	SaveCheckpoint(context.Context, string, *State) (json.RawMessage, error)
+	RestoreCheckpoint(context.Context, json.RawMessage, *State) error
 }
 
 // State is the concurrency-safe state shared by nodes within one workflow run.
@@ -138,11 +149,18 @@ func (n *ConditionNode) Execute(ctx context.Context, input string, state *State)
 	if err != nil {
 		return "", fmt.Errorf("condition %s error: %w", n.id, err)
 	}
+	if runtime, ok := task.RuntimeFrom(ctx); ok {
+		if scoped, scopedOK := runtime.(*workflowRuntime); scopedOK {
+			scoped.scope.tracker.mu.Lock()
+			scoped.scope.tracker.branches[n.id] = result
+			scoped.scope.tracker.mu.Unlock()
+		}
+	}
 	if result && n.TrueNode != nil {
-		return n.TrueNode.Execute(ctx, input, state)
+		return executeWorkflowNode(childWorkflowScope(ctx, n.TrueNode.ID(), input, state), n.TrueNode, input, state)
 	}
 	if !result && n.FalseNode != nil {
-		return n.FalseNode.Execute(ctx, input, state)
+		return executeWorkflowNode(childWorkflowScope(ctx, n.FalseNode.ID(), input, state), n.FalseNode, input, state)
 	}
 	return input, nil
 }
@@ -185,7 +203,14 @@ func (n *LoopNode) Execute(ctx context.Context, input string, state *State) (str
 		if !shouldContinue {
 			break
 		}
-		result, err := n.BodyNode.Execute(ctx, current, state)
+		if runtime, ok := task.RuntimeFrom(ctx); ok {
+			if scoped, scopedOK := runtime.(*workflowRuntime); scopedOK {
+				scoped.scope.tracker.mu.Lock()
+				scoped.scope.tracker.loops[n.id] = i
+				scoped.scope.tracker.mu.Unlock()
+			}
+		}
+		result, err := executeWorkflowNode(childWorkflowScope(ctx, n.BodyNode.ID(), current, state), n.BodyNode, current, state)
 		if err != nil {
 			return result, err
 		}
@@ -222,8 +247,19 @@ func (n *ParallelNode) Execute(ctx context.Context, input string, state *State) 
 		wg.Add(1)
 		go func(idx int, nd Node) {
 			defer wg.Done()
-			out, err := nd.Execute(ctx, input, state)
+			childCtx := childWorkflowScope(ctx, nd.ID(), input, state)
+			out, err := executeWorkflowNode(childCtx, nd, input, state)
 			results[idx] = nodeResult{output: out, err: err}
+			if err == nil {
+				if runtime, ok := task.RuntimeFrom(childCtx); ok {
+					if scoped, scopedOK := runtime.(*workflowRuntime); scopedOK {
+						scoped.scope.tracker.mu.Lock()
+						scoped.scope.tracker.completed[strings.Join(scoped.scope.path, "/")] = out
+						scoped.scope.tracker.mu.Unlock()
+						_ = scoped.checkpointState(childCtx, nil)
+					}
+				}
+			}
 		}(i, node)
 	}
 	wg.Wait()
@@ -302,6 +338,53 @@ func (w *Workflow) Validate() error {
 	return nil
 }
 
+// ValidateTaskMode rejects custom Nodes that cannot describe resumable state.
+// It does not affect the legacy synchronous Workflow API.
+func (w *Workflow) ValidateTaskMode() error {
+	if err := w.Validate(); err != nil {
+		return err
+	}
+	for _, node := range w.Nodes {
+		if err := validateTaskNode(node); err != nil {
+			return fmt.Errorf("workflow %q: %w", w.Name, err)
+		}
+	}
+	return nil
+}
+
+func validateTaskNode(node Node) error {
+	switch current := node.(type) {
+	case *StepNode:
+		if current.Agent == nil {
+			return fmt.Errorf("step %s has no agent", current.id)
+		}
+		return nil
+	case *ConditionNode:
+		if current.TrueNode != nil {
+			if err := validateTaskNode(current.TrueNode); err != nil {
+				return err
+			}
+		}
+		if current.FalseNode != nil {
+			return validateTaskNode(current.FalseNode)
+		}
+		return nil
+	case *LoopNode:
+		return validateTaskNode(current.BodyNode)
+	case *ParallelNode:
+		for _, child := range current.Nodes {
+			if err := validateTaskNode(child); err != nil {
+				return err
+			}
+		}
+		return nil
+	case CheckpointableNode:
+		return nil
+	default:
+		return fmt.Errorf("custom node %q must implement workflow.CheckpointableNode in Task mode", node.ID())
+	}
+}
+
 type WorkflowResult struct {
 	Output   string
 	Success  bool
@@ -334,8 +417,12 @@ func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 	state.Set("user_input", input)
 	current := input
 	var stepLogs []StepLog
+	var tracker *workflowTracker
+	if _, taskMode := task.RuntimeFrom(ctx); taskMode {
+		tracker = newWorkflowTracker(nil)
+	}
 
-	for _, node := range w.Nodes {
+	for index, node := range w.Nodes {
 		select {
 		case <-ctx.Done():
 			runErr := fmt.Errorf("workflow cancelled: %w", ctx.Err())
@@ -346,10 +433,25 @@ func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 		default:
 		}
 
+		if runtime, taskMode := task.RuntimeFrom(ctx); taskMode {
+			checkpoint := task.Checkpoint{
+				Kind: task.TurnWorkflow, Target: w.Name, Status: task.TurnRunning,
+				Workflow: &task.WorkflowCheckpoint{WorkflowID: w.Name, NodePath: []string{node.ID()}, NextNode: index, Current: current, State: state.Snapshot()},
+			}
+			if err := runtime.Checkpoint(ctx, checkpoint); err != nil {
+				workflowErr := fmt.Errorf("workflow checkpoint before node %s: %w", node.ID(), err)
+				return &WorkflowResult{Output: current, Success: false, Error: workflowErr.Error(), Err: workflowErr, State: state.Snapshot(), Duration: time.Since(start), StepLogs: stepLogs}
+			}
+		}
+
 		stepStart := time.Now()
 		w.logger.Info("executing node", "id", node.ID(), "type", node.Type())
 
-		output, err := node.Execute(ctx, current, state)
+		nodeCtx := ctx
+		if tracker != nil {
+			nodeCtx = withWorkflowScope(ctx, w.Name, index, current, state, []string{node.ID()}, tracker)
+		}
+		output, err := executeWorkflowNode(nodeCtx, node, current, state)
 		duration := time.Since(stepStart)
 
 		if err != nil {
@@ -371,11 +473,189 @@ func (w *Workflow) Run(ctx context.Context, input string) *WorkflowResult {
 		})
 		current = output
 	}
+	if runtime, taskMode := task.RuntimeFrom(ctx); taskMode {
+		checkpoint := task.Checkpoint{
+			Kind: task.TurnWorkflow, Target: w.Name, Status: task.TurnRunning,
+			Workflow: &task.WorkflowCheckpoint{WorkflowID: w.Name, NextNode: len(w.Nodes), Current: current, State: state.Snapshot()},
+		}
+		if err := runtime.Checkpoint(ctx, checkpoint); err != nil {
+			workflowErr := fmt.Errorf("workflow final checkpoint: %w", err)
+			return &WorkflowResult{Output: current, Success: false, Error: workflowErr.Error(), Err: workflowErr, State: state.Snapshot(), Duration: time.Since(start), StepLogs: stepLogs}
+		}
+	}
 
 	w.logger.Info("workflow completed", "duration", time.Since(start))
 	return &WorkflowResult{
 		Output: current, Success: true,
 		State: state.Snapshot(), Duration: time.Since(start), StepLogs: stepLogs,
+	}
+}
+
+// Resume continues a Workflow whose current Node is suspended at a safe user
+// interaction checkpoint. The caller supplies the already-encoded Tool result.
+func (w *Workflow) Resume(ctx context.Context, checkpoint task.WorkflowCheckpoint, toolResult string) *WorkflowResult {
+	start := time.Now()
+	if err := w.ValidateTaskMode(); err != nil {
+		return &WorkflowResult{Success: false, Error: err.Error(), Err: err}
+	}
+	if checkpoint.WorkflowID != w.Name {
+		err := fmt.Errorf("workflow checkpoint %q does not match %q", checkpoint.WorkflowID, w.Name)
+		return &WorkflowResult{Success: false, Error: err.Error(), Err: err}
+	}
+	if checkpoint.NextNode < 0 || checkpoint.NextNode >= len(w.Nodes) || len(checkpoint.NodePath) == 0 {
+		err := fmt.Errorf("workflow checkpoint node position is invalid")
+		return &WorkflowResult{Success: false, Error: err.Error(), Err: err}
+	}
+	state := NewState(checkpoint.State)
+	tracker := newWorkflowTracker(&checkpoint)
+	current := checkpoint.Current
+	node := w.Nodes[checkpoint.NextNode]
+	nodeCtx := withWorkflowScope(ctx, w.Name, checkpoint.NextNode, current, state, []string{node.ID()}, tracker)
+	output, err := resumeWorkflowNode(nodeCtx, node, checkpoint.NodePath, &checkpoint, toolResult, current, state)
+	logs := []StepLog{{NodeID: node.ID(), NodeType: node.Type(), Success: err == nil}}
+	if err != nil {
+		logs[0].Error = err.Error()
+		wrapped := fmt.Errorf("resume node %s: %w", node.ID(), err)
+		return &WorkflowResult{Output: current, Success: false, Error: wrapped.Error(), Err: wrapped, State: state.Snapshot(), Duration: time.Since(start), StepLogs: logs}
+	}
+	current = output
+	for index := checkpoint.NextNode + 1; index < len(w.Nodes); index++ {
+		node = w.Nodes[index]
+		if runtime, taskMode := task.RuntimeFrom(ctx); taskMode {
+			position := task.Checkpoint{Kind: task.TurnWorkflow, Target: w.Name, Status: task.TurnRunning, Workflow: &task.WorkflowCheckpoint{WorkflowID: w.Name, NodePath: []string{node.ID()}, NextNode: index, Current: current, State: state.Snapshot()}}
+			if checkpointErr := runtime.Checkpoint(ctx, position); checkpointErr != nil {
+				wrapped := fmt.Errorf("workflow checkpoint before node %s: %w", node.ID(), checkpointErr)
+				return &WorkflowResult{Output: current, Success: false, Error: wrapped.Error(), Err: wrapped, State: state.Snapshot(), Duration: time.Since(start), StepLogs: logs}
+			}
+		}
+		stepStart := time.Now()
+		nodeCtx = withWorkflowScope(ctx, w.Name, index, current, state, []string{node.ID()}, tracker)
+		output, err = executeWorkflowNode(nodeCtx, node, current, state)
+		logEntry := StepLog{NodeID: node.ID(), NodeType: node.Type(), Duration: time.Since(stepStart), Success: err == nil}
+		if err != nil {
+			logEntry.Error = err.Error()
+			logs = append(logs, logEntry)
+			wrapped := fmt.Errorf("node %s failed: %w", node.ID(), err)
+			return &WorkflowResult{Output: current, Success: false, Error: wrapped.Error(), Err: wrapped, State: state.Snapshot(), Duration: time.Since(start), StepLogs: logs}
+		}
+		logs = append(logs, logEntry)
+		current = output
+	}
+	return &WorkflowResult{Output: current, Success: true, State: state.Snapshot(), Duration: time.Since(start), StepLogs: logs}
+}
+
+func resumeWorkflowNode(ctx context.Context, node Node, path []string, checkpoint *task.WorkflowCheckpoint, toolResult, input string, state *State) (string, error) {
+	if len(path) == 0 || path[0] != node.ID() {
+		return input, fmt.Errorf("checkpoint path does not match node %q", node.ID())
+	}
+	switch current := node.(type) {
+	case *StepNode:
+		if current.Agent == nil {
+			return input, fmt.Errorf("step %s has no agent", current.id)
+		}
+		agentCheckpoint := checkpoint.Agent
+		if scoped, ok := task.RuntimeFrom(ctx); ok {
+			if workflowScope, scopeOK := scoped.(*workflowRuntime); scopeOK {
+				if saved := checkpoint.Agents[strings.Join(workflowScope.scope.path, "/")]; saved != nil {
+					agentCheckpoint = saved
+				}
+			}
+		}
+		if agentCheckpoint == nil || agentCheckpoint.PendingToolCall == nil {
+			return input, fmt.Errorf("step %s has no pending Agent checkpoint", current.id)
+		}
+		output := current.Agent.Resume(ctx, *agentCheckpoint, toolResult)
+		if !output.Success {
+			if output.Err != nil {
+				return input, output.Err
+			}
+			return input, fmt.Errorf("step %s failed: %s", current.id, output.Error)
+		}
+		agentInput := input
+		if current.InputStateKey != "" {
+			if value, ok := state.Get(current.InputStateKey); ok {
+				if text, textOK := value.(string); textOK && text != "" {
+					agentInput = text
+				}
+			}
+		}
+		if current.AfterExecute != nil {
+			current.AfterExecute(agentInput, output.Content, state)
+		}
+		return output.Content, nil
+	case *ConditionNode:
+		selected, ok := checkpoint.Branches[current.id]
+		if !ok {
+			return input, fmt.Errorf("condition %s branch is missing", current.id)
+		}
+		child := current.FalseNode
+		if selected {
+			child = current.TrueNode
+		}
+		if isNilNode(child) {
+			return input, nil
+		}
+		return resumeWorkflowNode(childWorkflowScope(ctx, child.ID(), input, state), child, path[1:], checkpoint, toolResult, input, state)
+	case *LoopNode:
+		iteration, ok := checkpoint.LoopIndexes[current.id]
+		if !ok {
+			return input, fmt.Errorf("loop %s iteration is missing", current.id)
+		}
+		result, err := resumeWorkflowNode(childWorkflowScope(ctx, current.BodyNode.ID(), input, state), current.BodyNode, path[1:], checkpoint, toolResult, input, state)
+		if err != nil {
+			return result, err
+		}
+		for next := iteration + 1; next < current.MaxIter; next++ {
+			shouldContinue, conditionErr := current.Condition(next, result, state)
+			if conditionErr != nil {
+				return result, conditionErr
+			}
+			if !shouldContinue {
+				break
+			}
+			result, err = executeWorkflowNode(childWorkflowScope(ctx, current.BodyNode.ID(), result, state), current.BodyNode, result, state)
+			if err != nil {
+				return result, err
+			}
+		}
+		return result, nil
+	case *ParallelNode:
+		parts := make([]string, len(current.Nodes))
+		for index, child := range current.Nodes {
+			if isNilNode(child) {
+				parts[index] = fmt.Sprintf("[child_%d] error: nil node", index)
+				continue
+			}
+			childCtx := childWorkflowScope(ctx, child.ID(), input, state)
+			key := ""
+			if scoped, ok := task.RuntimeFrom(childCtx); ok {
+				if workflowScope, scopeOK := scoped.(*workflowRuntime); scopeOK {
+					key = strings.Join(workflowScope.scope.path, "/")
+				}
+			}
+			childOutput, completed := checkpoint.Completed[key]
+			var childErr error
+			if !completed && len(path) > 1 && path[1] == child.ID() {
+				childOutput, childErr = resumeWorkflowNode(childCtx, child, path[1:], checkpoint, toolResult, input, state)
+			} else if !completed {
+				childOutput, childErr = executeWorkflowNode(childCtx, child, input, state)
+			}
+			if childErr != nil {
+				parts[index] = fmt.Sprintf("[%s] error: %v", child.ID(), childErr)
+			} else {
+				parts[index] = fmt.Sprintf("[%s] %s", child.ID(), childOutput)
+			}
+		}
+		return strings.Join(parts, "\n"), nil
+	case CheckpointableNode:
+		if data := checkpoint.NodeData[current.ID()]; data != nil {
+			if err := current.RestoreCheckpoint(ctx, data, state); err != nil {
+				return input, err
+			}
+		}
+		return current.Execute(ctx, input, state)
+	default:
+		return input, fmt.Errorf("node %s is not resumable", node.ID())
 	}
 }
 

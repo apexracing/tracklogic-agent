@@ -5,15 +5,21 @@ import "fmt"
 type ErrorCode string
 
 const (
-	ErrModelTimeout      ErrorCode = "MODEL_TIMEOUT"
-	ErrToolError         ErrorCode = "TOOL_ERROR"
-	ErrInvalidInput      ErrorCode = "INVALID_INPUT"
-	ErrInvalidConfig     ErrorCode = "INVALID_CONFIG"
-	ErrAPIError          ErrorCode = "API_ERROR"
-	ErrRateLimit         ErrorCode = "RATE_LIMIT"
-	ErrRunCancelled      ErrorCode = "RUN_CANCELLED"
-	ErrSecurityViolation ErrorCode = "SECURITY_VIOLATION"
-	ErrMaxLoopsExceeded  ErrorCode = "MAX_LOOPS_EXCEEDED"
+	ErrModelTimeout        ErrorCode = "MODEL_TIMEOUT"
+	ErrToolError           ErrorCode = "TOOL_ERROR"
+	ErrInvalidInput        ErrorCode = "INVALID_INPUT"
+	ErrInvalidConfig       ErrorCode = "INVALID_CONFIG"
+	ErrAPIError            ErrorCode = "API_ERROR"
+	ErrRateLimit           ErrorCode = "RATE_LIMIT"
+	ErrRunCancelled        ErrorCode = "RUN_CANCELLED"
+	ErrSecurityViolation   ErrorCode = "SECURITY_VIOLATION"
+	ErrMaxLoopsExceeded    ErrorCode = "MAX_LOOPS_EXCEEDED"
+	ErrCircuitOpen         ErrorCode = "CIRCUIT_OPEN"
+	ErrEventDelivery       ErrorCode = "EVENT_DELIVERY_FAILED"
+	ErrTurnNotFound        ErrorCode = "TURN_NOT_FOUND"
+	ErrInteractionNotFound ErrorCode = "INTERACTION_NOT_FOUND"
+	ErrRunInterrupted      ErrorCode = "RUN_INTERRUPTED"
+	ErrSummaryFailed       ErrorCode = "SUMMARY_FAILED"
 )
 
 type HarnessError struct {
