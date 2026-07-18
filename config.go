@@ -220,6 +220,14 @@ func validateHTTPURL(value string) error {
 }
 
 func (c ModelConfig) BuildModel() (model.Model, error) {
+	return c.BuildModelWithLogger(nil)
+}
+
+// BuildModelWithLogger builds a model using the application-owned logger.
+// The same logger is propagated to the protocol adapter and the model I/O
+// wrapper, so dynamically selected models use the same logging pipeline as
+// Harness, Agent, tools and MCP clients.
+func (c ModelConfig) BuildModelWithLogger(logger *slog.Logger) (model.Model, error) {
 	ResolveModelDefaults(&c)
 	if c.ModelID == "" || c.ModelID != strings.TrimSpace(c.ModelID) {
 		return nil, types.NewError(types.ErrInvalidConfig, "model_id must be non-empty and must not have surrounding whitespace")
@@ -232,7 +240,7 @@ func (c ModelConfig) BuildModel() (model.Model, error) {
 			return nil, types.WrapError(types.ErrInvalidConfig, "invalid base_url", err)
 		}
 	}
-	return c.buildModel(nil)
+	return c.buildModel(logger)
 }
 
 func (c ModelConfig) buildModel(logger *slog.Logger) (model.Model, error) {
@@ -241,34 +249,40 @@ func (c ModelConfig) buildModel(logger *slog.Logger) (model.Model, error) {
 		timeout = 60 * time.Second
 	}
 
+	var runtimeModel model.Model
+	var err error
 	switch c.APIFormat {
 	case "openai_response":
-		return model.NewOpenAI(model.OpenAIConfig{
+		runtimeModel = model.NewOpenAI(model.OpenAIConfig{
 			APIKey:  c.APIKey,
 			BaseURL: c.BaseURL,
 			ModelID: c.ModelID,
 			Timeout: timeout,
 			Logger:  logger,
-		}), nil
+		})
 	case "openai_chat_completions":
-		return model.NewOpenAIChat(model.OpenAIConfig{
+		runtimeModel = model.NewOpenAIChat(model.OpenAIConfig{
 			APIKey:  c.APIKey,
 			BaseURL: c.BaseURL,
 			ModelID: c.ModelID,
 			Timeout: timeout,
 			Logger:  logger,
-		}), nil
+		})
 	case "anthropic_message":
-		return model.NewAnthropic(model.AnthropicConfig{
+		runtimeModel = model.NewAnthropic(model.AnthropicConfig{
 			APIKey:  c.APIKey,
 			BaseURL: c.BaseURL,
 			ModelID: c.ModelID,
 			Timeout: timeout,
 			Logger:  logger,
-		}), nil
+		})
 	case "mock":
-		return model.NewMock(c.ModelID), nil
+		runtimeModel = model.NewMock(c.ModelID)
 	default:
-		return nil, fmt.Errorf("unsupported api_format: %s", c.APIFormat)
+		err = fmt.Errorf("unsupported api_format: %s", c.APIFormat)
 	}
+	if err != nil {
+		return nil, err
+	}
+	return model.WithLogger(runtimeModel, logger), nil
 }
