@@ -3,7 +3,17 @@ package model
 import (
 	"context"
 	"github.com/apexracing/tracklogic-agent/types"
+	"strings"
 )
+
+func normalizedReasoningEffort(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "low", "medium", "high":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
+}
 
 type Model interface {
 	Invoke(ctx context.Context, req *InvokeRequest) (*InvokeResponse, error)
@@ -18,11 +28,18 @@ type InvokeRequest struct {
 	Temperature float64
 	MaxTokens   int
 	Stream      bool
-	Extra       map[string]any
+	// ReasoningEffort is provider-neutral. Supported values are low, medium and
+	// high; an empty value leaves the upstream model's default unchanged.
+	ReasoningEffort string
+	// ReasoningDelta receives provider-returned reasoning summaries separately
+	// from visible answer content. It is used only by the local runtime.
+	ReasoningDelta func(string)
+	Extra          map[string]any
 }
 
 type InvokeResponse struct {
 	Content      string
+	Reasoning    string
 	ToolCalls    []types.ToolCall
 	Usage        *types.Usage
 	FinishReason string
@@ -31,6 +48,7 @@ type InvokeResponse struct {
 
 type ResponseChunk struct {
 	Content      string
+	Reasoning    string
 	ToolCall     *types.ToolCall
 	FinishReason string
 	Usage        *types.Usage

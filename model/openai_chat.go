@@ -22,6 +22,7 @@ type OpenAIChatProvider struct {
 	apiKey     string
 	baseURL    string
 	modelID    string
+	vendor     string
 	httpClient *http.Client
 	headers    http.Header
 	logger     *slog.Logger
@@ -45,6 +46,7 @@ func NewOpenAIChat(cfg OpenAIConfig) *OpenAIChatProvider {
 		apiKey:     cfg.APIKey,
 		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
 		modelID:    cfg.ModelID,
+		vendor:     strings.ToLower(strings.TrimSpace(cfg.Vendor)),
 		httpClient: configuredHTTPClient(cfg.HTTPClient, cfg.Timeout),
 		headers:    cfg.Headers.Clone(),
 		logger:     logger.With("component", "model", "provider", "openai_chat_completions", "model_id", cfg.ModelID),
@@ -55,11 +57,12 @@ func (p *OpenAIChatProvider) Provider() string { return "openai_chat_completions
 func (p *OpenAIChatProvider) ModelID() string  { return p.modelID }
 
 type chatMessage struct {
-	Role       string         `json:"role"`
-	Content    string         `json:"content"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
-	ToolCalls  []toolCallJSON `json:"tool_calls,omitempty"`
-	Name       string         `json:"name,omitempty"`
+	Role             string         `json:"role"`
+	Content          string         `json:"content"`
+	ReasoningContent string         `json:"reasoning_content,omitempty"`
+	ToolCallID       string         `json:"tool_call_id,omitempty"`
+	ToolCalls        []toolCallJSON `json:"tool_calls,omitempty"`
+	Name             string         `json:"name,omitempty"`
 }
 
 type toolCallJSON struct {
@@ -74,12 +77,18 @@ type toolFuncJSON struct {
 }
 
 type chatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	Tools       []toolDefJSON `json:"tools,omitempty"`
-	Temperature float64       `json:"temperature,omitempty"`
-	MaxTokens   int           `json:"max_tokens,omitempty"`
-	Stream      bool          `json:"stream,omitempty"`
+	Model           string        `json:"model"`
+	Messages        []chatMessage `json:"messages"`
+	Tools           []toolDefJSON `json:"tools,omitempty"`
+	Temperature     float64       `json:"temperature,omitempty"`
+	MaxTokens       int           `json:"max_tokens,omitempty"`
+	Stream          bool          `json:"stream,omitempty"`
+	ReasoningEffort string        `json:"reasoning_effort,omitempty"`
+	Thinking        *chatThinking `json:"thinking,omitempty"`
+}
+
+type chatThinking struct {
+	Type string `json:"type"`
 }
 
 type toolDefJSON struct {
@@ -99,22 +108,27 @@ type chatChoice struct {
 }
 
 type responseMsg struct {
-	Role      string         `json:"role"`
-	Content   string         `json:"content"`
-	ToolCalls []toolCallJSON `json:"tool_calls,omitempty"`
+	Role             string         `json:"role"`
+	Content          string         `json:"content"`
+	ReasoningContent string         `json:"reasoning_content,omitempty"`
+	ToolCalls        []toolCallJSON `json:"tool_calls,omitempty"`
 }
 
 type chatUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens            int `json:"prompt_tokens"`
+	CompletionTokens        int `json:"completion_tokens"`
+	TotalTokens             int `json:"total_tokens"`
+	CompletionTokensDetails *struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details,omitempty"`
 }
 
 type chatStreamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content   string         `json:"content,omitempty"`
-			ToolCalls []toolCallJSON `json:"tool_calls,omitempty"`
+			Content          string         `json:"content,omitempty"`
+			ReasoningContent string         `json:"reasoning_content,omitempty"`
+			ToolCalls        []toolCallJSON `json:"tool_calls,omitempty"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -164,7 +178,7 @@ func (p *OpenAIChatProvider) Invoke(ctx context.Context, req *InvokeRequest) (*I
 	}
 
 	msg := chatResp.Choices[0].Message
-	result := &InvokeResponse{Content: msg.Content}
+	result := &InvokeResponse{Content: msg.Content, Reasoning: msg.ReasoningContent}
 	for _, tc := range msg.ToolCalls {
 		result.ToolCalls = append(result.ToolCalls, types.ToolCall{
 			ID:   tc.ID,
@@ -182,9 +196,14 @@ func (p *OpenAIChatProvider) Invoke(ctx context.Context, req *InvokeRequest) (*I
 	}
 
 	if chatResp.Usage != nil {
+		reasoningTokens := 0
+		if chatResp.Usage.CompletionTokensDetails != nil {
+			reasoningTokens = chatResp.Usage.CompletionTokensDetails.ReasoningTokens
+		}
 		result.Usage = &types.Usage{
 			PromptTokens:     chatResp.Usage.PromptTokens,
 			CompletionTokens: chatResp.Usage.CompletionTokens,
+			ReasoningTokens:  reasoningTokens,
 			TotalTokens:      chatResp.Usage.TotalTokens,
 		}
 	}
@@ -252,7 +271,7 @@ func (p *OpenAIChatProvider) InvokeStream(ctx context.Context, req *InvokeReques
 			}
 
 			delta := chunk.Choices[0].Delta
-			rc := ResponseChunk{Content: delta.Content}
+			rc := ResponseChunk{Content: delta.Content, Reasoning: delta.ReasoningContent}
 			if len(delta.ToolCalls) > 0 {
 				tc := delta.ToolCalls[0]
 				rc.ToolCall = &types.ToolCall{
@@ -290,10 +309,11 @@ func (p *OpenAIChatProvider) buildRequest(req *InvokeRequest, stream bool) (*cha
 	msgs := make([]chatMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		cm := chatMessage{
-			Role:       string(m.Role),
-			Content:    m.Content,
-			ToolCallID: m.ToolCallID,
-			Name:       m.Name,
+			Role:             string(m.Role),
+			Content:          m.Content,
+			ReasoningContent: m.Reasoning,
+			ToolCallID:       m.ToolCallID,
+			Name:             m.Name,
 		}
 		for _, tc := range m.ToolCalls {
 			cm.ToolCalls = append(cm.ToolCalls, toolCallJSON{
@@ -314,6 +334,12 @@ func (p *OpenAIChatProvider) buildRequest(req *InvokeRequest, stream bool) (*cha
 		Temperature: req.Temperature,
 		MaxTokens:   req.MaxTokens,
 		Stream:      stream,
+	}
+	if effort := normalizedReasoningEffort(req.ReasoningEffort); effort != "" {
+		cReq.ReasoningEffort = effort
+		if p.vendor == "deepseek" {
+			cReq.Thinking = &chatThinking{Type: "enabled"}
+		}
 	}
 
 	for _, td := range req.Tools {

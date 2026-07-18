@@ -18,6 +18,7 @@ const (
 	EventTurnStatusChanged         EventType = "turn.status_changed"
 	EventUserMessage               EventType = "message.user"
 	EventAssistantMessageDelta     EventType = "message.assistant_delta"
+	EventAssistantReasoningDelta   EventType = "message.assistant_reasoning_delta"
 	EventAssistantMessageCompleted EventType = "message.assistant_completed"
 	EventProgressUpdated           EventType = "progress.updated"
 	EventInteractionRequested      EventType = "interaction.requested"

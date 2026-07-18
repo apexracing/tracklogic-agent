@@ -137,7 +137,14 @@ func invokeModelWithTaskPolicy(ctx context.Context, manager *ReliabilityManager,
 				onChunk(chunk)
 			}
 		}
-		response, invokeErr := invokeModel(ctx, runModel, request, wrappedChunk)
+		attemptRequest := *request
+		if request.ReasoningDelta != nil {
+			attemptRequest.ReasoningDelta = func(chunk string) {
+				streamed = true
+				request.ReasoningDelta(chunk)
+			}
+		}
+		response, invokeErr := invokeModel(ctx, runModel, &attemptRequest, wrappedChunk)
 		if invokeErr == nil {
 			outcome = circuitSuccess
 			return response, nil

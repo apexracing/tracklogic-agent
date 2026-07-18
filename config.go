@@ -257,6 +257,7 @@ func (c ModelConfig) buildModel(logger *slog.Logger) (model.Model, error) {
 			APIKey:  c.APIKey,
 			BaseURL: c.BaseURL,
 			ModelID: c.ModelID,
+			Vendor:  c.Vendor,
 			Timeout: timeout,
 			Logger:  logger,
 		})
@@ -265,6 +266,7 @@ func (c ModelConfig) buildModel(logger *slog.Logger) (model.Model, error) {
 			APIKey:  c.APIKey,
 			BaseURL: c.BaseURL,
 			ModelID: c.ModelID,
+			Vendor:  c.Vendor,
 			Timeout: timeout,
 			Logger:  logger,
 		})
@@ -273,6 +275,7 @@ func (c ModelConfig) buildModel(logger *slog.Logger) (model.Model, error) {
 			APIKey:  c.APIKey,
 			BaseURL: c.BaseURL,
 			ModelID: c.ModelID,
+			Vendor:  c.Vendor,
 			Timeout: timeout,
 			Logger:  logger,
 		})

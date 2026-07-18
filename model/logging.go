@@ -56,9 +56,11 @@ func (m *loggedModel) InvokeStream(ctx context.Context, req *InvokeRequest) (<-c
 	go func() {
 		defer close(output)
 		var content strings.Builder
+		var reasoning strings.Builder
 		var final *InvokeResponse
 		for chunk := range input {
 			content.WriteString(chunk.Content)
+			reasoning.WriteString(chunk.Reasoning)
 			if final == nil {
 				final = &InvokeResponse{}
 			}
@@ -85,6 +87,7 @@ func (m *loggedModel) InvokeStream(ctx context.Context, req *InvokeRequest) (<-c
 			final = &InvokeResponse{}
 		}
 		final.Content = content.String()
+		final.Reasoning = reasoning.String()
 		m.logResponse("model stream completed", final, time.Since(startedAt))
 	}()
 	return output, nil
@@ -94,7 +97,7 @@ func requestLogFields(req *InvokeRequest) []any {
 	if req == nil {
 		return []any{"messages", 0, "tools", 0, "stream", false}
 	}
-	return []any{"messages", len(req.Messages), "tools", len(req.Tools), "stream", req.Stream, "max_tokens", req.MaxTokens}
+	return []any{"messages", len(req.Messages), "tools", len(req.Tools), "stream", req.Stream, "max_tokens", req.MaxTokens, "reasoning_effort", req.ReasoningEffort}
 }
 
 func (m *loggedModel) logResponse(message string, response *InvokeResponse, duration time.Duration) {
@@ -106,6 +109,7 @@ func (m *loggedModel) logResponse(message string, response *InvokeResponse, dura
 		"duration", duration,
 		"content", response.Content,
 		"content_length", len(response.Content),
+		"reasoning_length", len(response.Reasoning),
 		"tool_calls", len(response.ToolCalls),
 		"finish_reason", response.FinishReason,
 	}
@@ -113,6 +117,7 @@ func (m *loggedModel) logResponse(message string, response *InvokeResponse, dura
 		fields = append(fields,
 			"input_tokens", response.Usage.PromptTokens,
 			"output_tokens", response.Usage.CompletionTokens,
+			"reasoning_tokens", response.Usage.ReasoningTokens,
 			"total_tokens", response.Usage.TotalTokens,
 		)
 	}

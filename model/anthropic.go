@@ -20,6 +20,7 @@ type AnthropicProvider struct {
 	apiKey     string
 	baseURL    string
 	modelID    string
+	vendor     string
 	httpClient *http.Client
 	headers    http.Header
 	logger     *slog.Logger
@@ -30,6 +31,7 @@ type AnthropicConfig struct {
 	APIKey  string
 	BaseURL string
 	ModelID string
+	Vendor  string
 	Timeout time.Duration
 	Logger  *slog.Logger
 	// HTTPClient is cloned before use. If its Timeout is zero, Timeout above is
@@ -56,6 +58,7 @@ func NewAnthropic(cfg AnthropicConfig) *AnthropicProvider {
 		apiKey:     cfg.APIKey,
 		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
 		modelID:    cfg.ModelID,
+		vendor:     strings.ToLower(strings.TrimSpace(cfg.Vendor)),
 		httpClient: configuredHTTPClient(cfg.HTTPClient, cfg.Timeout),
 		headers:    cfg.Headers.Clone(),
 		logger:     logger.With("component", "model", "provider", "anthropic", "model_id", cfg.ModelID),
@@ -69,13 +72,23 @@ func (p *AnthropicProvider) ModelID() string  { return p.modelID }
 // --- Messages API wire types ---
 
 type anthropicRequest struct {
-	Model       string          `json:"model"`
-	Messages    []anthropicMsg  `json:"messages"`
-	System      string          `json:"system,omitempty"`
-	Tools       []anthropicTool `json:"tools,omitempty"`
-	MaxTokens   int             `json:"max_tokens"`
-	Temperature float64         `json:"temperature,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
+	Model        string                 `json:"model"`
+	Messages     []anthropicMsg         `json:"messages"`
+	System       string                 `json:"system,omitempty"`
+	Tools        []anthropicTool        `json:"tools,omitempty"`
+	MaxTokens    int                    `json:"max_tokens"`
+	Temperature  float64                `json:"temperature,omitempty"`
+	Stream       bool                   `json:"stream,omitempty"`
+	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
+	Thinking     *anthropicThinking     `json:"thinking,omitempty"`
+}
+
+type anthropicOutputConfig struct {
+	Effort string `json:"effort"`
+}
+
+type anthropicThinking struct {
+	Type string `json:"type"`
 }
 
 type anthropicMsg struct {
@@ -91,6 +104,7 @@ type anthropicBlock struct {
 	Input     json.RawMessage `json:"input,omitempty"`
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   string          `json:"content,omitempty"`
+	Thinking  string          `json:"thinking,omitempty"`
 }
 
 type anthropicTool struct {
@@ -120,6 +134,7 @@ type anthropicStreamEvent struct {
 		Type        string `json:"type"`
 		Text        string `json:"text,omitempty"`
 		PartialJSON string `json:"partial_json,omitempty"`
+		Thinking    string `json:"thinking,omitempty"`
 		StopReason  string `json:"stop_reason,omitempty"`
 	} `json:"delta,omitempty"`
 	ContentBlock *anthropicBlock `json:"content_block,omitempty"`
@@ -249,6 +264,12 @@ func (p *AnthropicProvider) InvokeStream(ctx context.Context, req *InvokeRequest
 							return
 						}
 					}
+				case "thinking_delta":
+					if evt.Delta.Thinking != "" {
+						if !emitResponseChunk(ctx, ch, ResponseChunk{Reasoning: evt.Delta.Thinking}) {
+							return
+						}
+					}
 				case "input_json_delta":
 					if acc, ok := tools[evt.Index]; ok {
 						acc.args += evt.Delta.PartialJSON
@@ -327,6 +348,12 @@ func (p *AnthropicProvider) buildRequest(req *InvokeRequest, stream bool) (*anth
 		MaxTokens:   maxTokens,
 		Temperature: req.Temperature,
 		Stream:      stream,
+	}
+	if effort := normalizedReasoningEffort(req.ReasoningEffort); effort != "" {
+		apiReq.OutputConfig = &anthropicOutputConfig{Effort: effort}
+		if p.vendor == "anthropic" {
+			apiReq.Thinking = &anthropicThinking{Type: "adaptive"}
+		}
 	}
 
 	for _, td := range req.Tools {
@@ -414,6 +441,8 @@ func parseAnthropicResponse(apiResp *anthropicAPIResponse) *InvokeResponse {
 		switch block.Type {
 		case "text":
 			textParts = append(textParts, block.Text)
+		case "thinking":
+			result.Reasoning += block.Thinking
 		case "tool_use":
 			args := string(block.Input)
 			if args == "" {

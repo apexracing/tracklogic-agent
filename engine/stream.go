@@ -10,13 +10,14 @@ import (
 
 // consumeStream drains an InvokeStream channel into a complete InvokeResponse,
 // forwarding non-empty content deltas via onChunk (may be nil).
-func consumeStream(ctx context.Context, ch <-chan model.ResponseChunk, onChunk func(string)) (*model.InvokeResponse, error) {
+func consumeStream(ctx context.Context, ch <-chan model.ResponseChunk, onChunk, onReasoning func(string)) (*model.InvokeResponse, error) {
 	var (
-		contentBuilder strings.Builder
-		toolCalls      []types.ToolCall
-		toolIndex      = map[string]int{} // tool call ID -> index in toolCalls
-		finishReason   string
-		usage          *types.Usage
+		contentBuilder   strings.Builder
+		reasoningBuilder strings.Builder
+		toolCalls        []types.ToolCall
+		toolIndex        = map[string]int{} // tool call ID -> index in toolCalls
+		finishReason     string
+		usage            *types.Usage
 	)
 
 	for {
@@ -27,6 +28,7 @@ func consumeStream(ctx context.Context, ch <-chan model.ResponseChunk, onChunk f
 			if !ok {
 				return &model.InvokeResponse{
 					Content:      contentBuilder.String(),
+					Reasoning:    reasoningBuilder.String(),
 					ToolCalls:    toolCalls,
 					Usage:        usage,
 					FinishReason: finishReason,
@@ -41,6 +43,12 @@ func consumeStream(ctx context.Context, ch <-chan model.ResponseChunk, onChunk f
 					onChunk(chunk.Content)
 				}
 			}
+			if chunk.Reasoning != "" {
+				reasoningBuilder.WriteString(chunk.Reasoning)
+				if onReasoning != nil {
+					onReasoning(chunk.Reasoning)
+				}
+			}
 			if chunk.ToolCall != nil {
 				mergeToolCall(&toolCalls, toolIndex, chunk.ToolCall)
 			}
@@ -53,6 +61,7 @@ func consumeStream(ctx context.Context, ch <-chan model.ResponseChunk, onChunk f
 			if chunk.Done {
 				return &model.InvokeResponse{
 					Content:      contentBuilder.String(),
+					Reasoning:    reasoningBuilder.String(),
 					ToolCalls:    toolCalls,
 					Usage:        usage,
 					FinishReason: finishReason,

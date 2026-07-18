@@ -14,6 +14,7 @@ const (
 type Message struct {
 	Role       Role       `json:"role"`
 	Content    string     `json:"content"`
+	Reasoning  string     `json:"reasoning,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	Name       string     `json:"name,omitempty"`
@@ -34,5 +35,6 @@ type ToolCallFunction struct {
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
+	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
 	TotalTokens      int `json:"total_tokens"`
 }

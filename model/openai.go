@@ -29,6 +29,7 @@ type OpenAIConfig struct {
 	APIKey  string
 	BaseURL string
 	ModelID string
+	Vendor  string
 	Timeout time.Duration
 	Logger  *slog.Logger
 	// HTTPClient is cloned before use. If its Timeout is zero, Timeout above is
@@ -67,13 +68,19 @@ func (p *OpenAIProvider) ModelID() string  { return p.modelID }
 // --- Responses API wire types ---
 
 type responsesRequest struct {
-	Model           string          `json:"model"`
-	Input           []any           `json:"input"`
-	Instructions    string          `json:"instructions,omitempty"`
-	Tools           []responsesTool `json:"tools,omitempty"`
-	Temperature     float64         `json:"temperature,omitempty"`
-	MaxOutputTokens int             `json:"max_output_tokens,omitempty"`
-	Stream          bool            `json:"stream,omitempty"`
+	Model           string              `json:"model"`
+	Input           []any               `json:"input"`
+	Instructions    string              `json:"instructions,omitempty"`
+	Tools           []responsesTool     `json:"tools,omitempty"`
+	Temperature     float64             `json:"temperature,omitempty"`
+	MaxOutputTokens int                 `json:"max_output_tokens,omitempty"`
+	Stream          bool                `json:"stream,omitempty"`
+	Reasoning       *responsesReasoning `json:"reasoning,omitempty"`
+}
+
+type responsesReasoning struct {
+	Effort  string `json:"effort,omitempty"`
+	Summary string `json:"summary,omitempty"`
 }
 
 type responsesTool struct {
@@ -91,14 +98,20 @@ type responsesAPIResponse struct {
 }
 
 type responsesOutItem struct {
-	Type      string          `json:"type"`
-	ID        string          `json:"id,omitempty"`
-	CallID    string          `json:"call_id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Arguments string          `json:"arguments,omitempty"`
-	Role      string          `json:"role,omitempty"`
-	Content   json.RawMessage `json:"content,omitempty"`
-	Status    string          `json:"status,omitempty"`
+	Type      string             `json:"type"`
+	ID        string             `json:"id,omitempty"`
+	CallID    string             `json:"call_id,omitempty"`
+	Name      string             `json:"name,omitempty"`
+	Arguments string             `json:"arguments,omitempty"`
+	Role      string             `json:"role,omitempty"`
+	Content   json.RawMessage    `json:"content,omitempty"`
+	Status    string             `json:"status,omitempty"`
+	Summary   []responsesSummary `json:"summary,omitempty"`
+}
+
+type responsesSummary struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 type responsesContentPart struct {
@@ -107,9 +120,12 @@ type responsesContentPart struct {
 }
 
 type responsesUsageJSON struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-	TotalTokens  int `json:"total_tokens"`
+	InputTokens         int `json:"input_tokens"`
+	OutputTokens        int `json:"output_tokens"`
+	TotalTokens         int `json:"total_tokens"`
+	OutputTokensDetails *struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"output_tokens_details,omitempty"`
 }
 
 type responsesStreamEvent struct {
@@ -225,6 +241,12 @@ func (p *OpenAIProvider) InvokeStream(ctx context.Context, req *InvokeRequest) (
 						return
 					}
 				}
+			case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+				if evt.Delta != "" {
+					if !emitResponseChunk(ctx, ch, ResponseChunk{Reasoning: evt.Delta}) {
+						return
+					}
+				}
 			case "response.output_item.done":
 				var item responsesOutItem
 				if err := json.Unmarshal(evt.Item, &item); err != nil {
@@ -251,12 +273,17 @@ func (p *OpenAIProvider) InvokeStream(ctx context.Context, req *InvokeRequest) (
 				}
 				if err := json.Unmarshal([]byte(data), &completed); err == nil && completed.Response.Usage != nil {
 					u := completed.Response.Usage
+					reasoningTokens := 0
+					if u.OutputTokensDetails != nil {
+						reasoningTokens = u.OutputTokensDetails.ReasoningTokens
+					}
 					emitResponseChunk(ctx, ch, ResponseChunk{
 						Done:         true,
 						FinishReason: "stop",
 						Usage: &types.Usage{
 							PromptTokens:     u.InputTokens,
 							CompletionTokens: u.OutputTokens,
+							ReasoningTokens:  reasoningTokens,
 							TotalTokens:      u.TotalTokens,
 						},
 					})
@@ -290,6 +317,9 @@ func (p *OpenAIProvider) buildRequest(req *InvokeRequest, stream bool) (*respons
 		Temperature:     req.Temperature,
 		MaxOutputTokens: req.MaxTokens,
 		Stream:          stream,
+	}
+	if effort := normalizedReasoningEffort(req.ReasoningEffort); effort != "" {
+		apiReq.Reasoning = &responsesReasoning{Effort: effort, Summary: "auto"}
 	}
 
 	for _, td := range req.Tools {
@@ -370,6 +400,10 @@ func parseResponsesOutput(apiResp *responsesAPIResponse) *InvokeResponse {
 					Arguments: item.Arguments,
 				},
 			})
+		case "reasoning":
+			for _, summary := range item.Summary {
+				result.Reasoning += summary.Text
+			}
 		}
 	}
 
@@ -381,9 +415,14 @@ func parseResponsesOutput(apiResp *responsesAPIResponse) *InvokeResponse {
 	}
 
 	if apiResp.Usage != nil {
+		reasoningTokens := 0
+		if apiResp.Usage.OutputTokensDetails != nil {
+			reasoningTokens = apiResp.Usage.OutputTokensDetails.ReasoningTokens
+		}
 		result.Usage = &types.Usage{
 			PromptTokens:     apiResp.Usage.InputTokens,
 			CompletionTokens: apiResp.Usage.OutputTokens,
+			ReasoningTokens:  reasoningTokens,
 			TotalTokens:      apiResp.Usage.TotalTokens,
 		}
 	}

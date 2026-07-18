@@ -253,6 +253,9 @@ func (a *Agent) run(ctx context.Context, input string, resume *resumeState, opts
 					callerChunk(chunk)
 				}
 			}
+			req.ReasoningDelta = func(chunk string) {
+				_ = runtime.Emit(ctx, task.Event{RunID: runID, Type: task.EventAssistantReasoningDelta, Delivery: task.DeliveryBestEffort, Payload: task.EventPayload{Text: chunk}})
+			}
 		}
 		var resp *model.InvokeResponse
 		var err error
@@ -287,6 +290,7 @@ func (a *Agent) run(ctx context.Context, input string, resume *resumeState, opts
 		assistantMsg := types.Message{
 			Role:      types.RoleAssistant,
 			Content:   resp.Content,
+			Reasoning: resp.Reasoning,
 			CreatedAt: time.Now(),
 		}
 
@@ -459,7 +463,7 @@ func invokeModel(ctx context.Context, runModel model.Model, req *model.InvokeReq
 	if ch == nil {
 		return nil, types.NewError(types.ErrAPIError, "model returned a nil stream")
 	}
-	return consumeStream(ctx, ch, onChunk)
+	return consumeStream(ctx, ch, onChunk, req.ReasoningDelta)
 }
 
 func isNilRuntimeValue(value any) bool {

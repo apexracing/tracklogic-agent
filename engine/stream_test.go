@@ -18,7 +18,7 @@ func TestConsumeStream_ContentChunks(t *testing.T) {
 	var got []string
 	resp, err := consumeStream(context.Background(), ch, func(s string) {
 		got = append(got, s)
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("consumeStream: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestConsumeStream_MergeToolCalls(t *testing.T) {
 	ch <- model.ResponseChunk{Done: true, FinishReason: "tool_calls"}
 	close(ch)
 
-	resp, err := consumeStream(context.Background(), ch, nil)
+	resp, err := consumeStream(context.Background(), ch, nil, nil)
 	if err != nil {
 		t.Fatalf("consumeStream: %v", err)
 	}
@@ -68,8 +68,24 @@ func TestConsumeStream_Error(t *testing.T) {
 	ch <- model.ResponseChunk{Error: context.DeadlineExceeded}
 	close(ch)
 
-	_, err := consumeStream(context.Background(), ch, nil)
+	_, err := consumeStream(context.Background(), ch, nil, nil)
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestConsumeStream_SeparatesReasoning(t *testing.T) {
+	ch := make(chan model.ResponseChunk, 3)
+	ch <- model.ResponseChunk{Reasoning: "checking "}
+	ch <- model.ResponseChunk{Reasoning: "telemetry", Content: "answer", Done: true}
+	close(ch)
+
+	var reasoning string
+	resp, err := consumeStream(context.Background(), ch, nil, func(delta string) { reasoning += delta })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reasoning != "checking telemetry" || reasoning != resp.Reasoning || resp.Content != "answer" {
+		t.Fatalf("response = %#v, streamed reasoning = %q", resp, reasoning)
 	}
 }
