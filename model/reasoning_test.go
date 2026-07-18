@@ -9,7 +9,7 @@ func TestReasoningEffortIsMappedByProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if responses.Reasoning == nil || responses.Reasoning.Effort != "medium" || responses.Reasoning.Summary != "auto" {
+	if responses.Reasoning == nil || responses.Reasoning.Effort != "medium" || responses.Reasoning.Summary != "auto" || len(responses.Include) != 1 {
 		t.Fatalf("responses reasoning = %#v", responses.Reasoning)
 	}
 

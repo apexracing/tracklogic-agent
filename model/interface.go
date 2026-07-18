@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"github.com/apexracing/tracklogic-agent/types"
 	"strings"
 )
@@ -38,22 +39,24 @@ type InvokeRequest struct {
 }
 
 type InvokeResponse struct {
-	Content      string
-	Reasoning    string
-	ToolCalls    []types.ToolCall
-	Usage        *types.Usage
-	FinishReason string
-	Metadata     map[string]any
+	Content        string
+	Reasoning      string
+	ReasoningState []json.RawMessage
+	ToolCalls      []types.ToolCall
+	Usage          *types.Usage
+	FinishReason   string
+	Metadata       map[string]any
 }
 
 type ResponseChunk struct {
-	Content      string
-	Reasoning    string
-	ToolCall     *types.ToolCall
-	FinishReason string
-	Usage        *types.Usage
-	Done         bool
-	Error        error
+	Content        string
+	Reasoning      string
+	ReasoningState json.RawMessage
+	ToolCall       *types.ToolCall
+	FinishReason   string
+	Usage          *types.Usage
+	Done           bool
+	Error          error
 }
 
 type ToolDefinition struct {

@@ -288,10 +288,11 @@ func (a *Agent) run(ctx context.Context, input string, resume *resumeState, opts
 		}
 
 		assistantMsg := types.Message{
-			Role:      types.RoleAssistant,
-			Content:   resp.Content,
-			Reasoning: resp.Reasoning,
-			CreatedAt: time.Now(),
+			Role:           types.RoleAssistant,
+			Content:        resp.Content,
+			Reasoning:      resp.Reasoning,
+			ReasoningState: resp.ReasoningState,
+			CreatedAt:      time.Now(),
 		}
 
 		if len(resp.ToolCalls) > 0 {

@@ -105,6 +105,7 @@ type anthropicBlock struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   string          `json:"content,omitempty"`
 	Thinking  string          `json:"thinking,omitempty"`
+	Signature string          `json:"signature,omitempty"`
 }
 
 type anthropicTool struct {
@@ -135,6 +136,7 @@ type anthropicStreamEvent struct {
 		Text        string `json:"text,omitempty"`
 		PartialJSON string `json:"partial_json,omitempty"`
 		Thinking    string `json:"thinking,omitempty"`
+		Signature   string `json:"signature,omitempty"`
 		StopReason  string `json:"stop_reason,omitempty"`
 	} `json:"delta,omitempty"`
 	ContentBlock *anthropicBlock `json:"content_block,omitempty"`
@@ -227,6 +229,7 @@ func (p *AnthropicProvider) InvokeStream(ctx context.Context, req *InvokeRequest
 			id, name, args string
 		}
 		tools := map[int]*toolAcc{}
+		reasoningBlocks := map[int]*anthropicBlock{}
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -247,7 +250,10 @@ func (p *AnthropicProvider) InvokeStream(ctx context.Context, req *InvokeRequest
 
 			switch evt.Type {
 			case "content_block_start":
-				if evt.ContentBlock != nil && evt.ContentBlock.Type == "tool_use" {
+				if evt.ContentBlock != nil && evt.ContentBlock.Type == "thinking" {
+					copy := *evt.ContentBlock
+					reasoningBlocks[evt.Index] = &copy
+				} else if evt.ContentBlock != nil && evt.ContentBlock.Type == "tool_use" {
 					tools[evt.Index] = &toolAcc{
 						id:   evt.ContentBlock.ID,
 						name: evt.ContentBlock.Name,
@@ -266,9 +272,16 @@ func (p *AnthropicProvider) InvokeStream(ctx context.Context, req *InvokeRequest
 					}
 				case "thinking_delta":
 					if evt.Delta.Thinking != "" {
+						if block := reasoningBlocks[evt.Index]; block != nil {
+							block.Thinking += evt.Delta.Thinking
+						}
 						if !emitResponseChunk(ctx, ch, ResponseChunk{Reasoning: evt.Delta.Thinking}) {
 							return
 						}
+					}
+				case "signature_delta":
+					if block := reasoningBlocks[evt.Index]; block != nil {
+						block.Signature += evt.Delta.Signature
 					}
 				case "input_json_delta":
 					if acc, ok := tools[evt.Index]; ok {
@@ -276,6 +289,14 @@ func (p *AnthropicProvider) InvokeStream(ctx context.Context, req *InvokeRequest
 					}
 				}
 			case "content_block_stop":
+				if block, ok := reasoningBlocks[evt.Index]; ok {
+					if raw, err := json.Marshal(block); err == nil {
+						if !emitResponseChunk(ctx, ch, ResponseChunk{ReasoningState: raw}) {
+							return
+						}
+					}
+					delete(reasoningBlocks, evt.Index)
+				}
 				if acc, ok := tools[evt.Index]; ok {
 					if !emitResponseChunk(ctx, ch, ResponseChunk{
 						ToolCall: &types.ToolCall{
@@ -397,7 +418,13 @@ func messagesToAnthropic(msgs []types.Message) (system string, out []anthropicMs
 			out = append(out, anthropicMsg{Role: "user", Content: m.Content})
 		case types.RoleAssistant:
 			flushToolResults()
-			blocks := make([]anthropicBlock, 0, 1+len(m.ToolCalls))
+			blocks := make([]anthropicBlock, 0, len(m.ReasoningState)+1+len(m.ToolCalls))
+			for _, rawState := range m.ReasoningState {
+				var block anthropicBlock
+				if json.Unmarshal(rawState, &block) == nil && block.Type == "thinking" {
+					blocks = append(blocks, block)
+				}
+			}
 			if m.Content != "" {
 				blocks = append(blocks, anthropicBlock{Type: "text", Text: m.Content})
 			}
@@ -443,6 +470,9 @@ func parseAnthropicResponse(apiResp *anthropicAPIResponse) *InvokeResponse {
 			textParts = append(textParts, block.Text)
 		case "thinking":
 			result.Reasoning += block.Thinking
+			if raw, err := json.Marshal(block); err == nil {
+				result.ReasoningState = append(result.ReasoningState, raw)
+			}
 		case "tool_use":
 			args := string(block.Input)
 			if args == "" {

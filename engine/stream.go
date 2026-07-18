@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 
 	"github.com/apexracing/tracklogic-agent/model"
@@ -14,6 +15,7 @@ func consumeStream(ctx context.Context, ch <-chan model.ResponseChunk, onChunk, 
 	var (
 		contentBuilder   strings.Builder
 		reasoningBuilder strings.Builder
+		reasoningState   []json.RawMessage
 		toolCalls        []types.ToolCall
 		toolIndex        = map[string]int{} // tool call ID -> index in toolCalls
 		finishReason     string
@@ -27,11 +29,12 @@ func consumeStream(ctx context.Context, ch <-chan model.ResponseChunk, onChunk, 
 		case chunk, ok := <-ch:
 			if !ok {
 				return &model.InvokeResponse{
-					Content:      contentBuilder.String(),
-					Reasoning:    reasoningBuilder.String(),
-					ToolCalls:    toolCalls,
-					Usage:        usage,
-					FinishReason: finishReason,
+					Content:        contentBuilder.String(),
+					Reasoning:      reasoningBuilder.String(),
+					ReasoningState: reasoningState,
+					ToolCalls:      toolCalls,
+					Usage:          usage,
+					FinishReason:   finishReason,
 				}, nil
 			}
 			if chunk.Error != nil {
@@ -49,6 +52,9 @@ func consumeStream(ctx context.Context, ch <-chan model.ResponseChunk, onChunk, 
 					onReasoning(chunk.Reasoning)
 				}
 			}
+			if len(chunk.ReasoningState) > 0 {
+				reasoningState = append(reasoningState, append(json.RawMessage(nil), chunk.ReasoningState...))
+			}
 			if chunk.ToolCall != nil {
 				mergeToolCall(&toolCalls, toolIndex, chunk.ToolCall)
 			}
@@ -60,11 +66,12 @@ func consumeStream(ctx context.Context, ch <-chan model.ResponseChunk, onChunk, 
 			}
 			if chunk.Done {
 				return &model.InvokeResponse{
-					Content:      contentBuilder.String(),
-					Reasoning:    reasoningBuilder.String(),
-					ToolCalls:    toolCalls,
-					Usage:        usage,
-					FinishReason: finishReason,
+					Content:        contentBuilder.String(),
+					Reasoning:      reasoningBuilder.String(),
+					ReasoningState: reasoningState,
+					ToolCalls:      toolCalls,
+					Usage:          usage,
+					FinishReason:   finishReason,
 				}, nil
 			}
 		}

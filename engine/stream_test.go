@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/apexracing/tracklogic-agent/model"
@@ -77,7 +78,7 @@ func TestConsumeStream_Error(t *testing.T) {
 func TestConsumeStream_SeparatesReasoning(t *testing.T) {
 	ch := make(chan model.ResponseChunk, 3)
 	ch <- model.ResponseChunk{Reasoning: "checking "}
-	ch <- model.ResponseChunk{Reasoning: "telemetry", Content: "answer", Done: true}
+	ch <- model.ResponseChunk{Reasoning: "telemetry", ReasoningState: json.RawMessage(`{"type":"reasoning","encrypted_content":"opaque"}`), Content: "answer", Done: true}
 	close(ch)
 
 	var reasoning string
@@ -85,7 +86,7 @@ func TestConsumeStream_SeparatesReasoning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reasoning != "checking telemetry" || reasoning != resp.Reasoning || resp.Content != "answer" {
+	if resp.Reasoning != "checking telemetry" || reasoning != resp.Reasoning || resp.Content != "answer" || len(resp.ReasoningState) != 1 {
 		t.Fatalf("response = %#v, streamed reasoning = %q", resp, reasoning)
 	}
 }

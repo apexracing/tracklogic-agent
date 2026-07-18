@@ -67,6 +67,9 @@ func (m *loggedModel) InvokeStream(ctx context.Context, req *InvokeRequest) (<-c
 			if chunk.ToolCall != nil {
 				final.ToolCalls = append(final.ToolCalls, *chunk.ToolCall)
 			}
+			if len(chunk.ReasoningState) > 0 {
+				final.ReasoningState = append(final.ReasoningState, append([]byte(nil), chunk.ReasoningState...))
+			}
 			if chunk.Usage != nil {
 				final.Usage = chunk.Usage
 			}
@@ -110,6 +113,7 @@ func (m *loggedModel) logResponse(message string, response *InvokeResponse, dura
 		"content", response.Content,
 		"content_length", len(response.Content),
 		"reasoning_length", len(response.Reasoning),
+		"reasoning_state_items", len(response.ReasoningState),
 		"tool_calls", len(response.ToolCalls),
 		"finish_reason", response.FinishReason,
 	}

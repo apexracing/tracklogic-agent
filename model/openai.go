@@ -76,6 +76,7 @@ type responsesRequest struct {
 	MaxOutputTokens int                 `json:"max_output_tokens,omitempty"`
 	Stream          bool                `json:"stream,omitempty"`
 	Reasoning       *responsesReasoning `json:"reasoning,omitempty"`
+	Include         []string            `json:"include,omitempty"`
 }
 
 type responsesReasoning struct {
@@ -98,15 +99,16 @@ type responsesAPIResponse struct {
 }
 
 type responsesOutItem struct {
-	Type      string             `json:"type"`
-	ID        string             `json:"id,omitempty"`
-	CallID    string             `json:"call_id,omitempty"`
-	Name      string             `json:"name,omitempty"`
-	Arguments string             `json:"arguments,omitempty"`
-	Role      string             `json:"role,omitempty"`
-	Content   json.RawMessage    `json:"content,omitempty"`
-	Status    string             `json:"status,omitempty"`
-	Summary   []responsesSummary `json:"summary,omitempty"`
+	Type             string             `json:"type"`
+	ID               string             `json:"id,omitempty"`
+	CallID           string             `json:"call_id,omitempty"`
+	Name             string             `json:"name,omitempty"`
+	Arguments        string             `json:"arguments,omitempty"`
+	Role             string             `json:"role,omitempty"`
+	Content          json.RawMessage    `json:"content,omitempty"`
+	Status           string             `json:"status,omitempty"`
+	Summary          []responsesSummary `json:"summary,omitempty"`
+	EncryptedContent string             `json:"encrypted_content,omitempty"`
 }
 
 type responsesSummary struct {
@@ -266,6 +268,10 @@ func (p *OpenAIProvider) InvokeStream(ctx context.Context, req *InvokeRequest) (
 					}) {
 						return
 					}
+				} else if item.Type == "reasoning" {
+					if !emitResponseChunk(ctx, ch, ResponseChunk{ReasoningState: append(json.RawMessage(nil), evt.Item...)}) {
+						return
+					}
 				}
 			case "response.completed":
 				var completed struct {
@@ -320,6 +326,7 @@ func (p *OpenAIProvider) buildRequest(req *InvokeRequest, stream bool) (*respons
 	}
 	if effort := normalizedReasoningEffort(req.ReasoningEffort); effort != "" {
 		apiReq.Reasoning = &responsesReasoning{Effort: effort, Summary: "auto"}
+		apiReq.Include = []string{"reasoning.encrypted_content"}
 	}
 
 	for _, td := range req.Tools {
@@ -355,6 +362,12 @@ func messagesToResponsesInput(msgs []types.Message) (instructions string, input 
 				"content": m.Content,
 			})
 		case types.RoleAssistant:
+			for _, rawState := range m.ReasoningState {
+				var state any
+				if json.Unmarshal(rawState, &state) == nil {
+					input = append(input, state)
+				}
+			}
 			if m.Content != "" {
 				input = append(input, map[string]any{
 					"role":    "assistant",
@@ -401,6 +414,9 @@ func parseResponsesOutput(apiResp *responsesAPIResponse) *InvokeResponse {
 				},
 			})
 		case "reasoning":
+			if raw, err := json.Marshal(item); err == nil {
+				result.ReasoningState = append(result.ReasoningState, raw)
+			}
 			for _, summary := range item.Summary {
 				result.Reasoning += summary.Text
 			}

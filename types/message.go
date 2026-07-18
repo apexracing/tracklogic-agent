@@ -1,6 +1,9 @@
 package types
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type Role string
 
@@ -12,13 +15,14 @@ const (
 )
 
 type Message struct {
-	Role       Role       `json:"role"`
-	Content    string     `json:"content"`
-	Reasoning  string     `json:"reasoning,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	Name       string     `json:"name,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
+	Role           Role              `json:"role"`
+	Content        string            `json:"content"`
+	Reasoning      string            `json:"reasoning,omitempty"`
+	ReasoningState []json.RawMessage `json:"reasoning_state,omitempty"`
+	ToolCallID     string            `json:"tool_call_id,omitempty"`
+	ToolCalls      []ToolCall        `json:"tool_calls,omitempty"`
+	Name           string            `json:"name,omitempty"`
+	CreatedAt      time.Time         `json:"created_at"`
 }
 
 type ToolCall struct {
