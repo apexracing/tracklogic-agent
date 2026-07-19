@@ -347,6 +347,10 @@ func (a *Agent) run(ctx context.Context, input string, resume *resumeState, opts
 					payload := task.EventPayload{ToolName: tc.Function.Name, ToolCallID: tc.ID}
 					if err != nil {
 						payload.Error = err.Error()
+					} else if encoded, encodeErr := json.Marshal(result); encodeErr == nil {
+						payload.ToolResult = encoded
+					} else {
+						payload.Error = fmt.Sprintf("encode tool result: %v", encodeErr)
 					}
 					if emitErr := runtime.Emit(ctx, task.Event{RunID: runID, Type: task.EventToolCompleted, Delivery: task.DeliveryRequiredAck, Payload: payload}); emitErr != nil {
 						return failedRun(types.WrapError(types.ErrEventDelivery, "tool completion was not acknowledged", emitErr), mem, allToolCalls, totalTokens, loopCount)

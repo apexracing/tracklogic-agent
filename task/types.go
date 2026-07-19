@@ -62,14 +62,17 @@ const (
 )
 
 type EventPayload struct {
-	Text        string                `json:"text,omitempty"`
-	Status      TurnStatus            `json:"status,omitempty"`
-	Phase       string                `json:"phase,omitempty"`
-	AgentID     string                `json:"agent_id,omitempty"`
-	TeamID      string                `json:"team_id,omitempty"`
-	WorkflowID  string                `json:"workflow_id,omitempty"`
-	ToolName    string                `json:"tool_name,omitempty"`
-	ToolCallID  string                `json:"tool_call_id,omitempty"`
+	Text       string     `json:"text,omitempty"`
+	Status     TurnStatus `json:"status,omitempty"`
+	Phase      string     `json:"phase,omitempty"`
+	AgentID    string     `json:"agent_id,omitempty"`
+	TeamID     string     `json:"team_id,omitempty"`
+	WorkflowID string     `json:"workflow_id,omitempty"`
+	ToolName   string     `json:"tool_name,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	// ToolResult carries the JSON-encoded structured result so event sinks can
+	// persist domain evidence without parsing assistant prose.
+	ToolResult  json.RawMessage       `json:"tool_result,omitempty"`
 	Attempt     int                   `json:"attempt,omitempty"`
 	MaxAttempts int                   `json:"max_attempts,omitempty"`
 	NextAttempt int                   `json:"next_attempt,omitempty"`
