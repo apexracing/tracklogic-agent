@@ -365,9 +365,44 @@ func (a *Agent) run(ctx context.Context, input string, resume *resumeState, opts
 			continue
 		}
 
+		// A token-limited response is not a completed Agent turn. Reasoning
+		// models can spend the entire output budget on hidden reasoning and
+		// return no user-visible text at all. Preserve the assistant state and
+		// ask the model to continue in the next bounded Agent loop instead of
+		// incorrectly reporting an empty successful result.
+		if responseNeedsContinuation(resp) {
+			mem.Add(assistantMsg)
+			lastContent += resp.Content
+			mem.Add(types.Message{
+				Role:      types.RoleUser,
+				Content:   continuationInstruction(resp.Content != ""),
+				CreatedAt: time.Now(),
+			})
+			a.logger.Warn("model response incomplete; continuing",
+				"loop", loopCount,
+				"finish_reason", resp.FinishReason,
+				"content_length", len(resp.Content),
+				"reasoning_length", len(resp.Reasoning),
+			)
+			if taskMode {
+				_ = runtime.Emit(ctx, task.Event{RunID: runID, Type: task.EventProgressUpdated, Delivery: task.DeliveryBestEffort, Payload: task.EventPayload{Phase: "continuing_model"}})
+				checkpoint := agentCheckpoint(runtime, runID, a.Name(), cfg, mem, allToolCalls, nil, lastContent, totalTokens, loopCount)
+				if err := runtime.Checkpoint(ctx, checkpoint); err != nil {
+					return failedRun(types.WrapError(types.ErrEventDelivery, "continuation checkpoint was not acknowledged", err), mem, allToolCalls, totalTokens, loopCount)
+				}
+			}
+			continue
+		}
+
+		if strings.TrimSpace(resp.Content) == "" {
+			runErr := types.NewError(types.ErrAPIError, "model returned no visible content or tool call")
+			a.logger.Error("model invoke failed", "error", runErr, "finish_reason", resp.FinishReason)
+			return failedRun(runErr, mem, allToolCalls, totalTokens, loopCount)
+		}
+
 		assistantMsg.Content = resp.Content
 		mem.Add(assistantMsg)
-		lastContent = resp.Content
+		lastContent += resp.Content
 		if taskMode {
 			_ = runtime.Emit(ctx, task.Event{RunID: runID, Type: task.EventProgressUpdated, Delivery: task.DeliveryBestEffort, Payload: task.EventPayload{Phase: "preparing_answer"}})
 			checkpoint := agentCheckpoint(runtime, runID, a.Name(), cfg, mem, allToolCalls, nil, lastContent, totalTokens, loopCount)
@@ -404,6 +439,25 @@ func (a *Agent) run(ctx context.Context, input string, resume *resumeState, opts
 		TotalTokens: totalTokens,
 		LoopCount:   loopCount,
 	}
+}
+
+func responseNeedsContinuation(resp *model.InvokeResponse) bool {
+	if resp == nil || len(resp.ToolCalls) > 0 {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(resp.FinishReason)) {
+	case "max_tokens", "max_output_tokens", "length":
+		return true
+	}
+	return strings.TrimSpace(resp.Content) == "" &&
+		(strings.TrimSpace(resp.Reasoning) != "" || len(resp.ReasoningState) > 0)
+}
+
+func continuationInstruction(hasVisibleContent bool) string {
+	if hasVisibleContent {
+		return "Continue exactly where the previous response stopped without repeating it, then complete the task with the final user-visible answer."
+	}
+	return "Continue from the preserved reasoning state and complete the task now with a final user-visible answer."
 }
 
 func normalizeModelError(err error) error {
