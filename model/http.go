@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/apexracing/tracklogic-agent/types"
@@ -118,6 +119,50 @@ func configuredHTTPClient(client *http.Client, timeout time.Duration) *http.Clie
 		clone.Timeout = timeout
 	}
 	return &clone
+}
+
+// beginStreamingRequest applies the configured client timeout only while
+// establishing the response. http.Client.Timeout also covers reading the
+// entire body, which is incorrect for long-lived SSE responses: an active
+// reasoning stream would otherwise be cancelled at the fixed timeout even
+// while it is continuously delivering data. Once response headers arrive,
+// the caller's context exclusively controls the stream lifetime.
+func beginStreamingRequest(ctx context.Context, client *http.Client, request *http.Request) (*http.Response, context.CancelFunc, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	streamClient := *client
+	headerTimeout := streamClient.Timeout
+	streamClient.Timeout = 0
+
+	streamCtx, cancel := context.WithCancel(ctx)
+	request = request.Clone(streamCtx)
+	var headerTimedOut atomic.Bool
+	var timer *time.Timer
+	if headerTimeout > 0 {
+		timer = time.AfterFunc(headerTimeout, func() {
+			headerTimedOut.Store(true)
+			cancel()
+		})
+	}
+
+	response, err := streamClient.Do(request)
+	if timer != nil {
+		timer.Stop()
+	}
+	if err != nil {
+		cancel()
+		if headerTimedOut.Load() && ctx.Err() == nil {
+			return nil, nil, context.DeadlineExceeded
+		}
+		return nil, nil, err
+	}
+	if headerTimedOut.Load() {
+		response.Body.Close()
+		cancel()
+		return nil, nil, context.DeadlineExceeded
+	}
+	return response, cancel, nil
 }
 
 func applyCustomHeaders(request *http.Request, headers http.Header) {

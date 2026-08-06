@@ -232,7 +232,7 @@ func (p *OpenAIChatProvider) InvokeStream(ctx context.Context, req *InvokeReques
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 	applyCustomHeaders(httpReq, p.headers)
 
-	resp, err := p.httpClient.Do(httpReq)
+	resp, finishStream, err := beginStreamingRequest(ctx, p.httpClient, httpReq)
 	if err != nil {
 		return nil, modelTransportError(err)
 	}
@@ -240,6 +240,7 @@ func (p *OpenAIChatProvider) InvokeStream(ctx context.Context, req *InvokeReques
 	ch := make(chan ResponseChunk, 64)
 	go func() {
 		defer close(ch)
+		defer finishStream()
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {

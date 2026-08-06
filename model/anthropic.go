@@ -206,7 +206,7 @@ func (p *AnthropicProvider) InvokeStream(ctx context.Context, req *InvokeRequest
 	}
 	p.setHeaders(httpReq)
 
-	resp, err := p.httpClient.Do(httpReq)
+	resp, finishStream, err := beginStreamingRequest(ctx, p.httpClient, httpReq)
 	if err != nil {
 		return nil, modelTransportError(err)
 	}
@@ -214,6 +214,7 @@ func (p *AnthropicProvider) InvokeStream(ctx context.Context, req *InvokeRequest
 	ch := make(chan ResponseChunk, 64)
 	go func() {
 		defer close(ch)
+		defer finishStream()
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {

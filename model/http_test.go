@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -96,6 +97,66 @@ func TestProviderClonesHTTPClientAndAppliesCustomHeaders(t *testing.T) {
 	}
 	if gotHeader != "tenant-a" {
 		t.Fatalf("X-Tenant = %q", gotHeader)
+	}
+}
+
+func TestStreamingTimeoutOnlyCoversResponseHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		time.Sleep(80 * time.Millisecond)
+		_, _ = writer.Write([]byte("stream completed"))
+	}))
+	defer server.Close()
+
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := configuredHTTPClient(nil, 20*time.Millisecond)
+	started := time.Now()
+	response, finish, err := beginStreamingRequest(context.Background(), client, request)
+	if err != nil {
+		t.Fatalf("beginStreamingRequest() error = %v", err)
+	}
+	defer finish()
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read active stream after client timeout: %v", err)
+	}
+	if string(body) != "stream completed" {
+		t.Fatalf("stream body = %q", body)
+	}
+	if elapsed := time.Since(started); elapsed < 60*time.Millisecond {
+		t.Fatalf("stream completed in %s; test did not outlive the configured timeout", elapsed)
+	}
+	if client.Timeout != 20*time.Millisecond {
+		t.Fatalf("caller client timeout mutated to %s", client.Timeout)
+	}
+}
+
+func TestStreamingTimeoutStillBoundsResponseHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		time.Sleep(80 * time.Millisecond)
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := configuredHTTPClient(nil, 20*time.Millisecond)
+	response, finish, err := beginStreamingRequest(context.Background(), client, request)
+	if finish != nil {
+		finish()
+	}
+	if response != nil {
+		response.Body.Close()
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("beginStreamingRequest() error = %v, want deadline exceeded", err)
 	}
 }
 
